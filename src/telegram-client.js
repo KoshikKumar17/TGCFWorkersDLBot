@@ -3,12 +3,16 @@
  * Runs entirely in the browser - connections via WebSocket.
  * Authenticates as a bot using bot token.
  * Downloads files with NO size limit (unlike Bot API's 20MB cap).
+ * Supports PARALLEL chunk downloads for faster speeds.
  */
 
-// polyfills.js must be imported before this file
 import { TelegramClient, Api } from 'telegram';
+import { utils } from 'telegram';
+import bigInt from 'big-integer';
 
 const CREDENTIALS_KEY = 'tg_credentials';
+const MAX_CHUNK_SIZE = 512 * 1024; // 512KB - MTProto max per request
+const MIN_PARALLEL_SIZE = 1024 * 1024; // 1MB - minimum for parallel mode
 
 export class TGDownloader {
   constructor(onLog, onProgress) {
@@ -16,38 +20,25 @@ export class TGDownloader {
     this.onLog = onLog || (() => {});
     this.onProgress = onProgress || (() => {});
     this.connected = false;
+    this._fileCache = new Map(); // Cache file info by link
   }
 
-  /**
-   * Connect to Telegram using bot token via MTProto.
-   * Requires API ID & Hash from https://my.telegram.org
-   */
+  // ===== CONNECTION =====
+
   async connect(apiId, apiHash, botToken) {
     try {
       this.onLog('info', 'Initializing MTProto connection...');
-      
-      // Pass string to TelegramClient - it creates StoreSession internally
       this.client = new TelegramClient('tg_bot', parseInt(apiId), apiHash, {
         connectionRetries: 5,
-        useWSS: true, // WebSocket Secure for browser
+        useWSS: true,
       });
-
       this.onLog('info', 'Connecting to Telegram servers...');
-      
-      await this.client.start({
-        botAuthToken: botToken,
-      });
-
-      // Save credentials for auto-fill on next visit
+      await this.client.start({ botAuthToken: botToken });
       localStorage.setItem(CREDENTIALS_KEY, JSON.stringify({ apiId, apiHash, botToken }));
-      
       this.connected = true;
-      
-      // Get bot info
       const me = await this.client.getMe();
       this.onLog('success', `Connected as @${me.username} (${me.firstName})`);
-      this.onLog('dim', `Session saved in localStorage. Will reconnect faster next time.`);
-      
+      this.onLog('dim', `Session saved. Will reconnect faster next time.`);
       return { success: true, botInfo: me };
     } catch (error) {
       this.connected = false;
@@ -56,197 +47,357 @@ export class TGDownloader {
     }
   }
 
-  /**
-   * Disconnect the client
-   */
   async disconnect() {
     if (this.client) {
-      try {
-        await this.client.disconnect();
-      } catch {}
+      try { await this.client.disconnect(); } catch {}
       this.client = null;
       this.connected = false;
       this.onLog('info', 'Disconnected from Telegram.');
     }
   }
 
-  /**
-   * Try to restore a saved session
-   */
   getSavedCredentials() {
     try {
       const saved = localStorage.getItem(CREDENTIALS_KEY);
       return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
+    } catch { return null; }
   }
 
-  /**
-   * Clear all saved session data
-   */
   clearSession() {
     localStorage.removeItem(CREDENTIALS_KEY);
-    // Clear StoreSession keys
-    const keysToRemove = [];
-    for (let i = 0; i < localStorage.length; i++) {
+    this._fileCache.clear();
+    for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i);
-      if (key && key.startsWith('tg_bot:')) {
-        keysToRemove.push(key);
-      }
+      if (key && key.startsWith('tg_bot:')) localStorage.removeItem(key);
     }
-    keysToRemove.forEach(k => localStorage.removeItem(k));
   }
 
+  // ===== FETCH FILE INFO (cached) =====
+
   /**
-   * Fetch a message from a chat/channel by its ID.
-   * Works for both public usernames and private channel IDs.
+   * Fetch message and extract file location info. Results are cached by link key.
+   * Returns a reusable fileRef object for downloading (no need to re-fetch).
    */
-  async getMessage(chatIdentifier, messageId) {
+  async fetchFileInfo(chatIdentifier, messageId, cacheKey) {
     if (!this.client || !this.connected) {
       throw new Error('Not connected. Please connect first.');
     }
 
+    // Check cache first
+    if (cacheKey && this._fileCache.has(cacheKey)) {
+      this.onLog('dim', 'Using cached file info (no re-fetch needed).');
+      return this._fileCache.get(cacheKey);
+    }
+
     this.onLog('info', `Fetching message #${messageId}...`);
 
+    // Resolve entity
     let entity;
-    
     if (typeof chatIdentifier === 'string' && !chatIdentifier.startsWith('-')) {
-      // Public username
       this.onLog('dim', `Resolving @${chatIdentifier}...`);
       entity = await this.client.getEntity(chatIdentifier);
     } else {
-      // Private channel ID (e.g., -1002113604672)
       const id = typeof chatIdentifier === 'bigint' ? chatIdentifier : BigInt(chatIdentifier);
       this.onLog('dim', `Resolving channel ID ${id}...`);
       entity = await this.client.getEntity(id);
     }
 
+    // Fetch message
     const result = await this.client.getMessages(entity, { ids: [messageId] });
-    
     if (!result || result.length === 0 || !result[0]) {
-      throw new Error(`Message #${messageId} not found. Make sure the bot has access to this chat.`);
+      throw new Error(`Message #${messageId} not found. Make sure the bot has access.`);
     }
 
     const message = result[0];
-    this.onLog('success', `Message found!`);
-    
-    return { message, entity };
-  }
-
-  /**
-   * Extract file info from a message
-   */
-  getFileInfo(message) {
     const media = message.media;
-    if (!media) {
-      return null;
-    }
+    if (!media) throw new Error('This message has no media.');
 
+    // Extract file metadata
     let fileName = 'unknown';
     let fileSize = 0;
     let mimeType = '';
+    let fileLocation = null;
+    let dcId = null;
 
-    // Document (most files - includes video, audio, etc.)
     if (media.document) {
       const doc = media.document;
       fileSize = Number(doc.size);
       mimeType = doc.mimeType || '';
-      
-      // Get filename from attributes
+      dcId = doc.dcId;
+
       for (const attr of doc.attributes || []) {
         if (attr.className === 'DocumentAttributeFilename') {
           fileName = attr.fileName;
         }
       }
-      
       if (fileName === 'unknown' && mimeType) {
-        const ext = mimeType.split('/')[1] || 'bin';
-        fileName = `file_${message.id}.${ext}`;
+        fileName = `file_${message.id}.${mimeType.split('/')[1] || 'bin'}`;
       }
-    }
-    // Photo
-    else if (media.photo) {
-      fileName = `photo_${message.id}.jpg`;
-      mimeType = 'image/jpeg';
-      const sizes = media.photo.sizes || [];
+
+      // Create the reusable InputDocumentFileLocation
+      fileLocation = new Api.InputDocumentFileLocation({
+        id: doc.id,
+        accessHash: doc.accessHash,
+        fileReference: doc.fileReference,
+        thumbSize: '',
+      });
+    } else if (media.photo) {
+      const photo = media.photo;
+      const sizes = photo.sizes || [];
       const largest = sizes[sizes.length - 1];
-      if (largest && largest.size) {
-        fileSize = Number(largest.size);
-      }
+      fileSize = largest && largest.size ? Number(largest.size) : 0;
+      mimeType = 'image/jpeg';
+      fileName = `photo_${message.id}.jpg`;
+      dcId = photo.dcId;
+
+      fileLocation = new Api.InputPhotoFileLocation({
+        id: photo.id,
+        accessHash: photo.accessHash,
+        fileReference: photo.fileReference,
+        thumbSize: largest ? largest.type : '',
+      });
     }
 
-    return {
+    if (!fileLocation) {
+      throw new Error('Could not extract file location from message.');
+    }
+
+    const fileRef = {
       fileName,
       fileSize,
       mimeType,
+      fileLocation,
+      dcId,
+      message, // keep reference for fallback
       hasMedia: true,
     };
+
+    // Cache it
+    if (cacheKey) {
+      this._fileCache.set(cacheKey, fileRef);
+    }
+
+    this.onLog('success', `File: ${fileName} (${this._formatSize(fileSize)}) [${mimeType}]`);
+    return fileRef;
   }
 
+  // ===== DOWNLOAD =====
+
   /**
-   * Download file from a message with progress tracking.
-   * Uses GramJS's internal chunked download (512KB chunks via MTProto).
-   * 
-   * NOTE on parallel downloads:
-   * True multi-connection parallel downloads (like IDM/1DM) are NOT possible here because:
-   * 1. Telegram MTProto doesn't support HTTP-style range requests
-   * 2. GramJS downloads sequentially through a single DC sender connection
-   * 3. Creating multiple TelegramClient instances could trigger flood waits
-   * 
-   * GramJS already uses optimal 512KB chunks and auto-retries.
-   * Telegram server-side is the speed bottleneck, not the client.
+   * Download a file using cached fileRef.
+   * @param {object} fileRef - from fetchFileInfo()
+   * @param {number} connections - parallel connections (1-8)
    */
-  async downloadFile(message) {
+  async downloadFile(fileRef, connections = 1) {
     if (!this.client || !this.connected) {
       throw new Error('Not connected. Please connect first.');
     }
 
-    const fileInfo = this.getFileInfo(message);
-    if (!fileInfo) {
-      throw new Error('This message does not contain any downloadable media.');
+    connections = Math.min(Math.max(1, connections), 8);
+    const { fileSize, fileName, mimeType, fileLocation, dcId } = fileRef;
+
+    // For small files or single connection, use simple download
+    if (connections <= 1 || fileSize < MIN_PARALLEL_SIZE) {
+      this.onLog('info', `Downloading ${fileName} [1 connection]...`);
+      return this._downloadSingle(fileRef);
     }
 
-    this.onLog('info', `Downloading: ${fileInfo.fileName} (${this._formatSize(fileInfo.fileSize)})`);
+    // Parallel download
+    this.onLog('info', `Downloading ${fileName} [${connections} connections]...`);
+    return this._downloadParallel(fileRef, connections);
+  }
 
+  /**
+   * Single-connection download using GramJS downloadMedia (simple, reliable)
+   */
+  async _downloadSingle(fileRef) {
     const startTime = Date.now();
     let lastUpdate = 0;
 
-    const buffer = await this.client.downloadMedia(message, {
+    const buffer = await this.client.downloadMedia(fileRef.message, {
       progressCallback: (downloaded, total) => {
         const now = Date.now();
         if (now - lastUpdate < 200 && downloaded < total) return;
         lastUpdate = now;
-        
-        const elapsed = (now - startTime) / 1000;
-        const speed = Number(downloaded) / (elapsed || 1);
-        const percent = Number(total) > 0 ? (Number(downloaded) / Number(total)) * 100 : 0;
-        const remaining = speed > 0 ? (Number(total) - Number(downloaded)) / speed : 0;
-        
-        this.onProgress({
-          downloaded: Number(downloaded),
-          total: Number(total),
-          percent: Math.min(percent, 100),
-          speed,
-          elapsed,
-          remaining,
-        });
+        this._emitProgress(startTime, Number(downloaded), Number(total));
       },
     });
 
     if (!buffer) throw new Error('Download returned empty data.');
-
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    const avgSpeed = this._formatSize(fileInfo.fileSize / (parseFloat(elapsed) || 1));
-    this.onLog('success', `Download complete! (${elapsed}s, avg ${avgSpeed}/s)`);
-
-    const blob = new Blob([buffer], { type: fileInfo.mimeType || 'application/octet-stream' });
-    return { blob, fileInfo };
+    return this._finishDownload(buffer, fileRef, startTime);
   }
 
   /**
-   * Trigger a browser "Save As" dialog for a blob
+   * PARALLEL multi-connection download.
+   * Uses upload.GetFile with different offsets via multiple DC senders.
+   * Each worker downloads a range of the file simultaneously.
    */
+  async _downloadParallel(fileRef, connections) {
+    const { fileSize, fileLocation, dcId } = fileRef;
+    const startTime = Date.now();
+
+    // Calculate chunk distribution
+    const totalChunks = Math.ceil(fileSize / MAX_CHUNK_SIZE);
+    const actualConnections = Math.min(connections, totalChunks);
+    const chunksPerWorker = Math.ceil(totalChunks / actualConnections);
+
+    this.onLog('dim', `${totalChunks} chunks (${this._formatSize(MAX_CHUNK_SIZE)} each), ${actualConnections} workers`);
+
+    // Get senders (each creates a separate connection to the DC)
+    const senders = [];
+    try {
+      for (let i = 0; i < actualConnections; i++) {
+        const sender = await this.client.getSender(dcId);
+        senders.push(sender);
+      }
+    } catch (e) {
+      this.onLog('warn', `Could only create ${senders.length} senders: ${e.message}`);
+      if (senders.length === 0) {
+        this.onLog('warn', 'Falling back to single-connection download...');
+        return this._downloadSingle(fileRef);
+      }
+    }
+
+    // Track progress per worker
+    const workerProgress = new Array(actualConnections).fill(0);
+
+    // Create download tasks
+    const tasks = [];
+    for (let i = 0; i < actualConnections; i++) {
+      const startChunk = i * chunksPerWorker;
+      const endChunk = Math.min(startChunk + chunksPerWorker, totalChunks);
+      if (startChunk >= totalChunks) break;
+
+      const startOffset = startChunk * MAX_CHUNK_SIZE;
+      const endOffset = Math.min(endChunk * MAX_CHUNK_SIZE, fileSize);
+
+      tasks.push(
+        this._downloadRange(
+          fileLocation,
+          senders[i % senders.length],
+          startOffset,
+          endOffset,
+          i,
+          workerProgress,
+          startTime,
+          fileSize
+        )
+      );
+    }
+
+    // Run all workers in parallel
+    let results;
+    try {
+      results = await Promise.all(tasks);
+    } catch (e) {
+      this.onLog('warn', `Parallel download failed: ${e.message}. Retrying single...`);
+      return this._downloadSingle(fileRef);
+    }
+
+    // Merge all chunks in order into one buffer
+    const totalBytes = results.reduce((sum, buf) => sum + buf.length, 0);
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of results) {
+      merged.set(new Uint8Array(chunk.buffer || chunk), offset);
+      offset += chunk.length;
+    }
+
+    return this._finishDownload(Buffer.from(merged), fileRef, startTime);
+  }
+
+  /**
+   * Download a byte range using low-level upload.GetFile.
+   * Each call downloads from startOffset to endOffset in 512KB chunks.
+   */
+  async _downloadRange(fileLocation, sender, startOffset, endOffset, workerIdx, workerProgress, startTime, totalFileSize) {
+    const chunks = [];
+    let currentOffset = startOffset;
+
+    while (currentOffset < endOffset) {
+      // Limit MUST be a multiple of 4096 and between 4096-524288 for MTProto
+      // Always request full MAX_CHUNK_SIZE - server returns only what's available for last chunk
+      const remaining = endOffset - currentOffset;
+      const limit = remaining < MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : MAX_CHUNK_SIZE;
+
+      const request = new Api.upload.GetFile({
+        location: fileLocation,
+        offset: bigInt(currentOffset),
+        limit: limit,
+      });
+
+      let result;
+      try {
+        result = await this.client.invokeWithSender(request, sender);
+      } catch (e) {
+        if (e.message && e.message.includes('FILE_MIGRATE_')) {
+          // File is on another DC
+          const newDc = parseInt(e.message.match(/\d+/)?.[0] || '0');
+          if (newDc) {
+            this.onLog('dim', `Worker ${workerIdx + 1}: migrating to DC${newDc}`);
+            sender = await this.client.getSender(newDc);
+            result = await this.client.invokeWithSender(request, sender);
+          } else {
+            throw e;
+          }
+        } else {
+          throw e;
+        }
+      }
+
+      const bytes = result.bytes;
+      chunks.push(bytes);
+      currentOffset += bytes.length;
+
+      // Update progress
+      workerProgress[workerIdx] = currentOffset - startOffset;
+      const totalDownloaded = workerProgress.reduce((a, b) => a + b, 0);
+      this._emitProgress(startTime, totalDownloaded, totalFileSize);
+
+      // If we got less than requested, we've reached the end
+      if (bytes.length < limit) break;
+    }
+
+    // Merge this worker's chunks
+    const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
+    const merged = Buffer.alloc(totalLen);
+    let pos = 0;
+    for (const chunk of chunks) {
+      chunk.copy ? chunk.copy(merged, pos) : merged.set(new Uint8Array(chunk), pos);
+      pos += chunk.length;
+    }
+
+    this.onLog('dim', `Worker ${workerIdx + 1}: done (${this._formatSize(totalLen)})`);
+    return merged;
+  }
+
+  // ===== HELPERS =====
+
+  _finishDownload(buffer, fileRef, startTime) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const avgSpeed = this._formatSize(fileRef.fileSize / (parseFloat(elapsed) || 1));
+    this.onLog('success', `Download complete! (${elapsed}s, avg ${avgSpeed}/s)`);
+
+    const blob = new Blob([buffer], { type: fileRef.mimeType || 'application/octet-stream' });
+    return { blob, fileInfo: fileRef };
+  }
+
+  _emitProgress(startTime, downloadedBytes, totalBytes) {
+    const now = Date.now();
+    const elapsed = (now - startTime) / 1000;
+    const speed = downloadedBytes / (elapsed || 1);
+    const percent = totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0;
+    const remaining = speed > 0 ? (totalBytes - downloadedBytes) / speed : 0;
+    this.onProgress({
+      downloaded: downloadedBytes,
+      total: totalBytes,
+      percent: Math.min(percent, 100),
+      speed,
+      elapsed,
+      remaining,
+    });
+  }
+
   saveBlobAs(blob, fileName) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -255,58 +406,8 @@ export class TGDownloader {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    
-    // Revoke after a delay to ensure download starts
     setTimeout(() => URL.revokeObjectURL(url), 30000);
-    
     this.onLog('success', `💾 File saved: ${fileName}`);
-  }
-
-  /**
-   * Get a direct HTTP download URL via Bot API (for download managers like 1DM).
-   * Only works for files under 20MB (Telegram Bot API limit).
-   */
-  async getDirectHttpLink(message, botToken) {
-    const fileInfo = this.getFileInfo(message);
-    if (!fileInfo) throw new Error('No media in this message.');
-
-    // Use Bot API getFile to get file_path
-    // We need the file_id which we can get from the message
-    const media = message.media;
-    let fileId;
-
-    if (media.document) {
-      // GramJS stores file reference info, but for Bot API we need the bot API file_id
-      // We'll use the Bot API directly via HTTP
-      this.onLog('info', 'Fetching Bot API file info...');
-      
-      // Forward approach: use the bot token to call getFile via Bot API
-      // But we need the Bot API file_id, not the MTProto one
-      // The workaround: use MTProto to get the message, then use Bot API
-    }
-
-    // Alternative: use the Telegram Bot API directly
-    // First call getUpdates or use the chat_id + message_id
-    const chatId = message.peerId?.channelId 
-      ? `-100${message.peerId.channelId}` 
-      : message.peerId?.chatId 
-        ? `-${message.peerId.chatId}` 
-        : message.peerId?.userId?.toString();
-
-    if (!chatId) throw new Error('Could not determine chat ID for Bot API.');
-
-    // Copy message to get Bot API file_id  
-    const apiUrl = `https://api.telegram.org/bot${botToken}`;
-    
-    // Forward the message to self to get file_id via Bot API
-    // Actually, we can use copyMessage or just try to get the file directly
-    // Simplest: use /getChat + /forwardMessage to self, but bots can't message themselves
-    
-    // Better approach: just provide the file via our own blob URL
-    this.onLog('warn', '⚠️ Direct HTTP links require Bot API (limited to 20MB files).');
-    this.onLog('info', 'For files > 20MB, use the built-in browser download instead.');
-    
-    return null;
   }
 
   _formatSize(bytes) {

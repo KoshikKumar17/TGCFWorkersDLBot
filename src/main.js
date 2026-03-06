@@ -1,16 +1,9 @@
 /**
  * Telegram File Downloader - Client-Side MTProto
- * 
- * Runs entirely in the user's browser via GramJS (Telethon for JS).
- * Connects to Telegram's MTProto servers via WebSocket.
- * No file size limits. No server needed. Session stored locally.
- * 
- * Deploy as a static site on Cloudflare Pages.
+ * Two-step flow: Fetch file info (cached) → Download with parallel connections
  */
 
-// MUST be first import - sets up Buffer/process globals before GramJS loads
 import './polyfills.js';
-
 import './style.css';
 import { TGDownloader } from './telegram-client.js';
 import { parseTelegramLink, describeParsedLink, formatFileSize, getFileIcon } from './link-parser.js';
@@ -19,16 +12,14 @@ import { parseTelegramLink, describeParsedLink, formatFileSize, getFileIcon } fr
 let downloader = null;
 let isConnected = false;
 let isDownloading = false;
+let currentFileRef = null; // Cached file reference
 
 // ===== Initialize UI =====
 function init() {
   const app = document.getElementById('app');
   app.innerHTML = renderApp();
-  
-  // Bind events
   bindEvents();
   
-  // Try to restore saved credentials
   const tempDownloader = new TGDownloader(() => {}, () => {});
   const saved = tempDownloader.getSavedCredentials();
   if (saved) {
@@ -40,7 +31,6 @@ function init() {
   addLog('dim', 'Ready. Enter your credentials and connect.');
   addLog('dim', 'All processing happens in your browser. Nothing is sent to any server.');
   
-  // Auto-reconnect if we have saved credentials
   if (saved && saved.apiId && saved.apiHash && saved.botToken) {
     addLog('info', 'Found saved session. Auto-reconnecting...');
     autoReconnect(saved);
@@ -51,7 +41,7 @@ function renderApp() {
   return `
     <div class="header">
       <h1>📥 Telegram File Downloader</h1>
-      <p>Client-side MTProto • No file size limits • Powered by GramJS</p>
+      <p>Client-side MTProto • No file size limits • Parallel downloads • Powered by GramJS</p>
     </div>
 
     <!-- Connection Card -->
@@ -86,12 +76,8 @@ function renderApp() {
       </p>
 
       <div class="mt-16" style="display: flex; gap: 8px;">
-        <button class="btn-primary" id="btnConnect" style="flex: 1;">
-          ⚡ Connect
-        </button>
-        <button class="btn-outline btn-sm" id="btnClearSession" title="Clear saved session">
-          🗑️
-        </button>
+        <button class="btn-primary" id="btnConnect" style="flex: 1;">⚡ Connect</button>
+        <button class="btn-outline btn-sm" id="btnClearSession" title="Clear saved session">🗑️</button>
       </div>
     </div>
 
@@ -108,13 +94,32 @@ function renderApp() {
         <p class="text-dim" id="parsedLinkText"></p>
       </div>
 
-      <button class="btn-success mt-12" id="btnDownload" disabled>
-        📥 Fetch & Download
+      <!-- Step 1: Fetch Info -->
+      <button class="btn-primary mt-12" id="btnFetchInfo" disabled>
+        🔍 Fetch File Info
       </button>
 
       <!-- File Info (shown after fetch) -->
       <div id="fileInfoBox" class="hidden">
         <dl class="file-info" id="fileInfoContent"></dl>
+        
+        <!-- Step 2: Download with parallel connections -->
+        <div class="mt-16" style="display: flex; gap: 8px; align-items: center;">
+          <div class="form-group" style="margin-bottom: 0; flex: 0 0 auto;">
+            <label for="connections" style="margin-bottom: 4px;">Connections</label>
+            <select id="connections" style="background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; color: var(--text); font-size: 0.95rem; font-family: inherit;">
+              <option value="1">1 (Standard)</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4" selected>4</option>
+              <option value="6">6</option>
+              <option value="8">8 (Max)</option>
+            </select>
+          </div>
+          <button class="btn-success" id="btnDownload" style="flex: 1; margin-top: 18px;">
+            📥 Download
+          </button>
+        </div>
       </div>
 
       <!-- Progress -->
@@ -160,29 +165,33 @@ function renderApp() {
 // ===== Event Bindings =====
 function bindEvents() {
   document.getElementById('btnConnect').addEventListener('click', handleConnect);
+  document.getElementById('btnFetchInfo').addEventListener('click', handleFetchInfo);
   document.getElementById('btnDownload').addEventListener('click', handleDownload);
   document.getElementById('btnClearLog').addEventListener('click', () => {
     document.getElementById('logContainer').innerHTML = '';
   });
   document.getElementById('btnClearSession').addEventListener('click', handleClearSession);
   
-  // Live parse the link as user types
   document.getElementById('messageLink').addEventListener('input', (e) => {
     const parsed = parseTelegramLink(e.target.value);
     const infoEl = document.getElementById('parsedLinkInfo');
     const textEl = document.getElementById('parsedLinkText');
     
+    // Reset file info when link changes
+    currentFileRef = null;
+    document.getElementById('fileInfoBox').classList.add('hidden');
+    
     if (parsed) {
       infoEl.classList.remove('hidden');
       textEl.textContent = '✅ ' + describeParsedLink(parsed);
-      document.getElementById('btnDownload').disabled = !isConnected;
+      document.getElementById('btnFetchInfo').disabled = !isConnected;
     } else if (e.target.value.trim()) {
       infoEl.classList.remove('hidden');
       textEl.textContent = '❌ Invalid Telegram link';
-      document.getElementById('btnDownload').disabled = true;
+      document.getElementById('btnFetchInfo').disabled = true;
     } else {
       infoEl.classList.add('hidden');
-      document.getElementById('btnDownload').disabled = true;
+      document.getElementById('btnFetchInfo').disabled = true;
     }
   });
 }
@@ -197,16 +206,13 @@ async function autoReconnect(saved) {
   try {
     downloader = new TGDownloader(addLog, updateProgress);
     await downloader.connect(saved.apiId, saved.apiHash, saved.botToken);
-    
     isConnected = true;
     setConnectionStatus('connected');
     btn.innerHTML = '🔌 Disconnect';
     btn.className = 'btn-danger';
-    
-    // Enable download if link is already entered
     const link = document.getElementById('messageLink').value.trim();
     if (parseTelegramLink(link)) {
-      document.getElementById('btnDownload').disabled = false;
+      document.getElementById('btnFetchInfo').disabled = false;
     }
   } catch (error) {
     setConnectionStatus('disconnected');
@@ -221,14 +227,13 @@ async function autoReconnect(saved) {
 async function handleConnect() {
   const btn = document.getElementById('btnConnect');
   
-  // If already connected, disconnect
   if (isConnected && downloader) {
     await downloader.disconnect();
     setConnectionStatus('disconnected');
     isConnected = false;
     btn.innerHTML = '⚡ Connect';
     btn.className = 'btn-primary';
-    document.getElementById('btnDownload').disabled = true;
+    document.getElementById('btnFetchInfo').disabled = true;
     return;
   }
 
@@ -237,7 +242,7 @@ async function handleConnect() {
   const botToken = document.getElementById('botToken').value.trim();
 
   if (!apiId || !apiHash || !botToken) {
-    addLog('error', 'Please fill in all credentials (API ID, API Hash, Bot Token).');
+    addLog('error', 'Please fill in all credentials.');
     return;
   }
 
@@ -248,16 +253,13 @@ async function handleConnect() {
   try {
     downloader = new TGDownloader(addLog, updateProgress);
     await downloader.connect(apiId, apiHash, botToken);
-    
     isConnected = true;
     setConnectionStatus('connected');
     btn.innerHTML = '🔌 Disconnect';
     btn.className = 'btn-danger';
-    
-    // Enable download if link is already entered
     const link = document.getElementById('messageLink').value.trim();
     if (parseTelegramLink(link)) {
-      document.getElementById('btnDownload').disabled = false;
+      document.getElementById('btnFetchInfo').disabled = false;
     }
   } catch (error) {
     setConnectionStatus('disconnected');
@@ -268,31 +270,19 @@ async function handleConnect() {
   }
 }
 
-// ===== Download Handler =====
-async function handleDownload() {
-  if (!isConnected || !downloader || isDownloading) return;
+// ===== Step 1: Fetch File Info =====
+async function handleFetchInfo() {
+  if (!isConnected || !downloader) return;
 
   const linkInput = document.getElementById('messageLink').value.trim();
   const parsed = parseTelegramLink(linkInput);
-  
-  if (!parsed) {
-    addLog('error', 'Invalid Telegram link.');
-    return;
-  }
+  if (!parsed) { addLog('error', 'Invalid Telegram link.'); return; }
 
-  const btn = document.getElementById('btnDownload');
-  const progressBox = document.getElementById('progressBox');
-  const fileInfoBox = document.getElementById('fileInfoBox');
-  
+  const btn = document.getElementById('btnFetchInfo');
   btn.disabled = true;
-  btn.innerHTML = '⏳ Downloading...';
-  isDownloading = true;
-  progressBox.classList.remove('hidden');
-  fileInfoBox.classList.add('hidden');
-  resetProgress();
+  btn.innerHTML = '⏳ Fetching...';
 
   try {
-    // Determine chat identifier
     let chatId;
     if (parsed.type === 'public') {
       chatId = parsed.username;
@@ -300,35 +290,52 @@ async function handleDownload() {
       chatId = parsed.fullChannelId.toString();
     }
 
-    // Fetch message
     addLog('info', `Resolving: ${describeParsedLink(parsed)}`);
-    const { message } = await downloader.getMessage(chatId, parsed.messageId);
+    
+    // Fetch file info (cached by link)
+    currentFileRef = await downloader.fetchFileInfo(chatId, parsed.messageId, linkInput);
 
-    // Get file info
-    const fileInfo = downloader.getFileInfo(message);
-    if (!fileInfo || !fileInfo.hasMedia) {
-      throw new Error('This message does not contain any downloadable media.');
-    }
+    // Show file info + download button
+    showFileInfo(currentFileRef);
 
-    // Show file info
-    showFileInfo(fileInfo);
+    btn.innerHTML = '✅ File info loaded';
+    setTimeout(() => { btn.innerHTML = '🔍 Fetch File Info'; }, 2000);
+  } catch (error) {
+    addLog('error', `Fetch failed: ${error.message}`);
+    btn.innerHTML = '🔍 Fetch File Info';
+    currentFileRef = null;
+  } finally {
+    btn.disabled = false;
+  }
+}
 
-    // Download
-    const { blob } = await downloader.downloadFile(message);
+// ===== Step 2: Download =====
+async function handleDownload() {
+  if (!isConnected || !downloader || isDownloading || !currentFileRef) return;
 
-    // Save to user's device
+  const connections = parseInt(document.getElementById('connections').value) || 4;
+  const btn = document.getElementById('btnDownload');
+  const progressBox = document.getElementById('progressBox');
+  
+  btn.disabled = true;
+  btn.innerHTML = '⏳ Downloading...';
+  isDownloading = true;
+  progressBox.classList.remove('hidden');
+  resetProgress();
+
+  try {
+    // Download using cached fileRef — no re-fetch needed!
+    const { blob, fileInfo } = await downloader.downloadFile(currentFileRef, connections);
+
+    // Save to device
     downloader.saveBlobAs(blob, fileInfo.fileName);
-
-    // Add to history
     addToHistory(fileInfo);
 
-    btn.innerHTML = '✅ Done! Download Another?';
-    setTimeout(() => {
-      btn.innerHTML = '📥 Fetch & Download';
-    }, 3000);
+    btn.innerHTML = '✅ Done!';
+    setTimeout(() => { btn.innerHTML = '📥 Download'; }, 3000);
   } catch (error) {
     addLog('error', `Download failed: ${error.message}`);
-    btn.innerHTML = '📥 Fetch & Download';
+    btn.innerHTML = '📥 Download';
   } finally {
     btn.disabled = false;
     isDownloading = false;
@@ -342,6 +349,7 @@ function handleClearSession() {
   document.getElementById('apiId').value = '';
   document.getElementById('apiHash').value = '';
   document.getElementById('botToken').value = '';
+  currentFileRef = null;
   addLog('info', 'Session and credentials cleared.');
 }
 
@@ -349,7 +357,6 @@ function handleClearSession() {
 function setConnectionStatus(status) {
   const badge = document.getElementById('statusBadge');
   const text = document.getElementById('statusText');
-  
   badge.className = `status-badge ${status}`;
   text.textContent = status.charAt(0).toUpperCase() + status.slice(1);
 }
@@ -357,7 +364,6 @@ function setConnectionStatus(status) {
 function addLog(type, message) {
   const container = document.getElementById('logContainer');
   if (!container) return;
-  
   const time = new Date().toLocaleTimeString();
   const entry = document.createElement('div');
   entry.className = `log-entry ${type}`;
@@ -371,7 +377,6 @@ function updateProgress(progress) {
   const percent = document.getElementById('progressPercent');
   const speed = document.getElementById('progressSpeed');
   const eta = document.getElementById('progressEta');
-  
   if (!bar) return;
   
   bar.style.width = `${progress.percent.toFixed(1)}%`;
@@ -395,14 +400,15 @@ function resetProgress() {
   document.getElementById('progressEta').textContent = '--';
 }
 
-function showFileInfo(fileInfo) {
+function showFileInfo(fileRef) {
   const box = document.getElementById('fileInfoBox');
   const content = document.getElementById('fileInfoContent');
   
   content.innerHTML = `
-    <dt>📄 File</dt><dd>${fileInfo.fileName}</dd>
-    <dt>📊 Size</dt><dd>${formatFileSize(fileInfo.fileSize)}</dd>
-    <dt>📎 Type</dt><dd>${fileInfo.mimeType || 'Unknown'}</dd>
+    <dt>📄 File</dt><dd>${fileRef.fileName}</dd>
+    <dt>📊 Size</dt><dd>${formatFileSize(fileRef.fileSize)}</dd>
+    <dt>📎 Type</dt><dd>${fileRef.mimeType || 'Unknown'}</dd>
+    <dt>🏢 DC</dt><dd>DC ${fileRef.dcId || '?'}</dd>
   `;
   
   box.classList.remove('hidden');
@@ -412,10 +418,7 @@ function addToHistory(fileInfo) {
   const list = document.getElementById('historyList');
   const icon = getFileIcon(fileInfo.mimeType, fileInfo.fileName);
   
-  // Clear "no downloads" placeholder
-  if (list.querySelector('.text-dim')) {
-    list.innerHTML = '';
-  }
+  if (list.querySelector('.text-dim')) list.innerHTML = '';
   
   const item = document.createElement('div');
   item.className = 'history-item';
@@ -426,16 +429,11 @@ function addToHistory(fileInfo) {
       <div class="file-meta">${formatFileSize(fileInfo.fileSize)} • ${fileInfo.mimeType || 'Unknown'} • ${new Date().toLocaleTimeString()}</div>
     </div>
   `;
-  
   list.prepend(item);
 }
 
 // ===== Boot =====
 document.addEventListener('DOMContentLoaded', init);
-
-// Handle page unload - disconnect gracefully
 window.addEventListener('beforeunload', () => {
-  if (downloader && isConnected) {
-    downloader.disconnect().catch(() => {});
-  }
+  if (downloader && isConnected) downloader.disconnect().catch(() => {});
 });
