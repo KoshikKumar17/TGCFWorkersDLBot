@@ -1181,5 +1181,5 @@ function setAuthInputsLocked(locked) {
 }
 
 function formatDuration(seconds) { if (!seconds) return ''; const m = Math.floor(seconds / 60); const s = Math.floor(seconds % 60); return `${m}:${s.toString().padStart(2, '0')}`; }
-function escHtml(str) { const div = document.createElement('div'); div.textContent = str; return div.innerHTML; }
+function escHtml(str) { const div = document.createElement('div'); div.textContent = str; return div.innerHTML.replace(/\n/g, '<br>'); }
 function escAttr(str) { return (str || '').replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
