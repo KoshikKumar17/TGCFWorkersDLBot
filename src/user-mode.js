@@ -672,14 +672,21 @@ async function handleUserLogin() {
 
 async function autoReconnectUser(addLog) {
   setUserStatus('connecting');
+  userLog('info', '🔄 Reconnecting to Telegram...');
+  // Update status bar text
+  ['userLoggedInAs', 'userLoggedInAs2'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = '⏳ Reconnecting...';
+  });
   try {
     userClient = new TGUserClient(userLog, updateUserProgress);
     const ok = await userClient.reconnect();
     if (ok) {
+      userLog('success', '✅ Reconnected successfully!');
       onUserLoggedIn();
     } else {
       setUserStatus('disconnected');
-      userLog('warn', 'Session expired. Auto-cleaning...');
+      userLog('warn', '⚠️ Session expired. Auto-cleaning...');
       // Auto-clean expired session
       const tempClean = new TGUserClient(() => {}, () => {});
       tempClean.clearSession();
