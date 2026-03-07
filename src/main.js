@@ -269,7 +269,12 @@ function renderApp(hasSavedCreds) {
           <input type="checkbox" id="settingsProxy" style="width: auto; accent-color: var(--primary);" />
           <span>🌐 Enable Cloudflare Proxy</span>
         </label>
-        <p class="hint">Route Telegram connections through /api/ proxy. Use when Telegram is blocked in your region. Requires Cloudflare Pages Functions deployment.</p>
+        <p class="hint">Route Telegram connections through a CF Worker proxy. Use when Telegram is blocked.</p>
+      </div>
+      <div class="form-group" style="margin-top: 8px;">
+        <label for="settingsProxyDomain">Proxy Worker Domain</label>
+        <input type="text" id="settingsProxyDomain" placeholder="tg-ws-api.your-account.workers.dev" style="background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; color: var(--text); font-size: 0.88rem;" />
+        <p class="hint">Your deployed TG-WS-API worker domain. Leave empty to use same-origin /api/ fallback.</p>
       </div>
       <div class="mt-12">
         <button class="btn-primary btn-sm" id="btnSaveSettings" style="width: auto;">💾 Save Settings</button>
@@ -1272,20 +1277,24 @@ function loadSettingsUI() {
   const workersEl = document.getElementById('settingsWorkers');
   const chunkEl = document.getElementById('settingsChunkSize');
   const proxyEl = document.getElementById('settingsProxy');
-  if (workersEl) workersEl.value = s.parallelWorkers || 8;
+  const proxyDomainEl = document.getElementById('settingsProxyDomain');
+  if (workersEl) workersEl.value = s.parallelWorkers || 4;
   if (chunkEl) chunkEl.value = (s.chunkSize || 524288).toString();
   if (proxyEl) proxyEl.checked = !!s.proxyEnabled;
+  if (proxyDomainEl) proxyDomainEl.value = s.proxyDomain || '';
 }
 
 function handleSaveSettings() {
-  const workers = parseInt(document.getElementById('settingsWorkers')?.value) || 8;
+  const workers = parseInt(document.getElementById('settingsWorkers')?.value) || 4;
   const chunkSize = parseInt(document.getElementById('settingsChunkSize')?.value) || 524288;
   const proxyEnabled = !!document.getElementById('settingsProxy')?.checked;
+  const proxyDomain = (document.getElementById('settingsProxyDomain')?.value || '').trim();
 
   const s = getSettings();
   s.parallelWorkers = Math.min(Math.max(1, workers), 8);
   s.chunkSize = chunkSize;
   s.proxyEnabled = proxyEnabled;
+  s.proxyDomain = proxyDomain;
   saveSettings(s);
 
   const status = document.getElementById('settingsSaveStatus');

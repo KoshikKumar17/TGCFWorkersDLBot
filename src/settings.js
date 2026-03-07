@@ -22,6 +22,7 @@ const DEFAULTS = {
   parallelWorkers: 4,
   chunkSize: 524288,       // 512KB — MTProto standard max
   proxyEnabled: false,
+  proxyDomain: '',         // External CF Worker domain (e.g. tg-ws-api.username.workers.dev)
   autoChunkSize: false,
   bestChunkSize: null,     // Auto-detected best chunk size (set by auto-tuning)
 };
