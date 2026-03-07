@@ -94,6 +94,8 @@ export async function addMessageToConversation(msgData) {
         thumbnailUrl: msgData.thumbnailUrl || null,
         date: msgData.date instanceof Date ? msgData.date.toISOString() : (msgData.date || new Date().toISOString()),
         fromBot: !!msgData.fromBot, // true if sent by us
+        replyToMsgId: msgData.replyToMsgId || null,
+        replyToText: msgData.replyToText || null,
       };
       
       // Avoid duplicates
@@ -118,8 +120,12 @@ export async function addMessageToConversation(msgData) {
 
 /**
  * Save a bot reply to a conversation.
+ * @param {string} senderId
+ * @param {string} text
+ * @param {number|string} [replyToMsgId] - message ID we replied to
+ * @param {string} [replyToText] - preview of the message we replied to
  */
-export async function addBotReplyToConversation(senderId, text) {
+export async function addBotReplyToConversation(senderId, text, replyToMsgId, replyToText) {
   if (!db) return;
   return addMessageToConversation({
     id: `bot_${Date.now()}`,
@@ -127,6 +133,8 @@ export async function addBotReplyToConversation(senderId, text) {
     text,
     date: new Date(),
     fromBot: true,
+    replyToMsgId: replyToMsgId || null,
+    replyToText: replyToText || null,
   });
 }
 

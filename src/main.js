@@ -993,11 +993,12 @@ function appendMessageToChatPopup(msg) {
   const time = msg.date ? new Date(msg.date).toLocaleTimeString() : '';
   const div = document.createElement('div');
 
-  // Reply-to context bar
+  // Reply-to context bar (clickable to scroll to original message)
   let replyBar = '';
-  if (msg.replyToText) {
-    const short = msg.replyToText.length > 60 ? msg.replyToText.slice(0, 60) + '...' : msg.replyToText;
-    replyBar = `<div class="reply-quote-bar" style="margin-bottom:4px;"><span class="reply-quote-text">↩ ${escapeHtml(short)}</span></div>`;
+  if (msg.replyToText || msg.replyToMsgId) {
+    const short = msg.replyToText ? (msg.replyToText.length > 60 ? msg.replyToText.slice(0, 60) + '...' : msg.replyToText) : `Message #${msg.replyToMsgId}`;
+    const scrollTarget = msg.replyToMsgId ? `botmsg_${msg.replyToMsgId}` : '';
+    replyBar = `<div class="reply-quote-bar" style="margin-bottom:4px; cursor:pointer;" ${scrollTarget ? `onclick="var el=document.getElementById('${scrollTarget}'); if(el){el.scrollIntoView({behavior:'smooth',block:'center'}); el.classList.add('highlight-msg'); setTimeout(()=>el.classList.remove('highlight-msg'),1500);}"` : ''}><span class="reply-quote-text">↩ ${escapeHtml(short)}</span></div>`;
   }
 
   if (msg.fromBot) {
@@ -1193,18 +1194,24 @@ async function handleSendReply() {
 
     await downloader.sendMessage(chatPeer, text, replyToMsgId || undefined);
 
+    // Capture reply context before clearing
+    const savedReplyToMsgId = replyToMsgId;
+    const savedReplyToText = replyToMsgId ? (document.querySelector('.reply-quote-text')?.textContent?.replace('↩ Replying to: ', '') || '') : null;
+
     // Clear reply-to state
     replyToMsgId = null;
     document.getElementById('replyOriginalMsg').innerHTML = '';
 
-    // Save our reply to DB
-    await addBotReplyToConversation(currentChatConvo.senderId, text);
+    // Save our reply to DB (with reply context)
+    await addBotReplyToConversation(currentChatConvo.senderId, text, savedReplyToMsgId, savedReplyToText);
 
     // Show in popup
     appendMessageToChatPopup({
       text,
       date: new Date().toISOString(),
       fromBot: true,
+      replyToMsgId: savedReplyToMsgId || null,
+      replyToText: savedReplyToText || null,
     });
 
     // Update conversation item preview
