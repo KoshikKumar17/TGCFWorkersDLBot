@@ -65,10 +65,14 @@ function showLandingPage() {
 
 function initUserMode() {
   const app = document.getElementById('app');
-  renderUserMode(app, addLog, (mode) => {
+  const switchMode = (mode) => {
     if (mode === 'bot') { setSavedMode('bot'); initBotMode(); }
     else { setSavedMode(null); showLandingPage(); }
-  });
+  };
+  // Store globally so account switcher can re-render user mode
+  window._userModeSwitchMode = switchMode;
+  window._userModeAddLog = addLog;
+  renderUserMode(app, addLog, switchMode);
 }
 
 // ===== Initialize UI =====

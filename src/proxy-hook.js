@@ -38,10 +38,12 @@ class ProxiedWebSocket extends _OriginalWebSocket {
     // Check if proxy is enabled (read directly from localStorage to avoid circular imports)
     let proxyEnabled = false;
     try {
-      const raw = localStorage.getItem('tgcf_settings');
-      if (raw) {
-        const settings = JSON.parse(raw);
-        proxyEnabled = !!settings.proxyEnabled;
+      for (const key of ['tgcf_settings_bot', 'tgcf_settings_user', 'tgcf_settings']) {
+        const raw = localStorage.getItem(key);
+        if (raw) {
+          const settings = JSON.parse(raw);
+          if (settings.proxyEnabled) { proxyEnabled = true; break; }
+        }
       }
     } catch {}
 
@@ -51,13 +53,15 @@ class ProxiedWebSocket extends _OriginalWebSocket {
         const host = match[1]; // e.g. venus-1.web.telegram.org
         const path = match[2] || ''; // e.g. /apiws
 
-        // Get proxy domain from settings
+        // Get proxy domain from settings (check bot, user, and legacy keys)
         let proxyDomain = '';
         try {
-          const raw = localStorage.getItem('tgcf_settings');
-          if (raw) {
-            const s = JSON.parse(raw);
-            proxyDomain = (s.proxyDomain || '').trim();
+          for (const key of ['tgcf_settings_bot', 'tgcf_settings_user', 'tgcf_settings']) {
+            const raw = localStorage.getItem(key);
+            if (raw) {
+              const s = JSON.parse(raw);
+              if (s.proxyDomain) { proxyDomain = (s.proxyDomain || '').trim(); break; }
+            }
           }
         } catch {}
 

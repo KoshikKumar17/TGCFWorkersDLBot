@@ -1,9 +1,12 @@
 /**
  * User Mode UI — Full Telegram client experience.
- * Chat list, message viewer, media download, send messages.
+ * Two-page layout:
+ *   - Main page: Chat list, message viewer, media
+ *   - Settings page: Login, account management, user settings
  */
 
-import { TGUserClient } from './user-client.js';
+import { TGUserClient, getAccounts, getNextSessionIndex, getActiveAccountIndex, setActiveAccountIndex, removeAccount } from './user-client.js';
+import { getUserSettings, saveUserSettings, getUserDefaults } from './settings.js';
 import { formatFileSize, getFileIcon } from './link-parser.js';
 
 let userClient = null;
@@ -12,10 +15,13 @@ let currentDialogId = null;
 let currentDialogTitle = null;
 let dialogsCache = [];
 let userReplyToMsgId = null;
-let oldestMsgId = 0; // For pagination (load older messages)
+let oldestMsgId = 0;
 let isLoadingOlder = false;
+let _currentPage = 'main'; // 'main' | 'settings'
 
-// Persist UI state
+const thumbCache = new Map();
+const rawMessageCache = new Map();
+
 const USER_UI_KEY = 'tgcf_user_ui';
 function saveUIState() {
   localStorage.setItem(USER_UI_KEY, JSON.stringify({
@@ -28,122 +34,244 @@ function getUIState() {
   try { return JSON.parse(localStorage.getItem(USER_UI_KEY)) || {}; } catch { return {}; }
 }
 
+/**
+ * Get last-used API credentials for auto-fill.
+ */
+function getLastCreds() {
+  const accounts = getAccounts();
+  if (accounts.length > 0) {
+    const last = accounts[accounts.length - 1];
+    return { apiId: last.apiId || '', apiHash: last.apiHash || '' };
+  }
+  return { apiId: '', apiHash: '' };
+}
+
 export function renderUserMode(container, addLog, switchMode) {
+  // Store globally for account switcher re-renders
+  window._userModeSwitchMode = switchMode;
+  window._userModeAddLog = addLog;
+
+  const accounts = getAccounts();
+  const activeIdx = getActiveAccountIndex();
+  const activeAccount = accounts.find(a => a.idx === activeIdx);
+  const isLoggedIn = userClient && userClient.connected;
+  const accountName = activeAccount?.name || (userClient?.me ? `${userClient.me.firstName || ''} ${userClient.me.lastName || ''}`.trim() : '');
+
   container.innerHTML = `
     <div class="header">
       <h1>👤 Telegram User Client</h1>
       <p>Client-side MTProto • Browse chats, view media, download files</p>
+      <div class="header-actions">
+        <button class="btn-outline btn-sm" id="btnUserSettings">⚙️ Settings</button>
+        <button class="btn-outline btn-sm" id="btnSwitchToBot">🤖 Bot Mode</button>
+      </div>
     </div>
 
-    <!-- Auth Card -->
-    <div class="card" id="userAuthCard">
-      <div class="flex-between mb-8">
-        <h2><span class="icon">🔐</span> User Login</h2>
-        <span class="status-badge disconnected" id="userStatusBadge">
-          <span class="status-dot"></span>
-          <span id="userStatusText">Not logged in</span>
-        </span>
-      </div>
-      <div id="userAuthForm">
-        <div class="form-row">
-          <div class="form-group">
-            <label for="userApiId">API ID</label>
-            <input type="text" id="userApiId" placeholder="12345678" autocomplete="off" />
-          </div>
-          <div class="form-group">
-            <label for="userApiHash">API Hash</label>
-            <input type="password" id="userApiHash" placeholder="abc123def456..." autocomplete="off" />
+    <!-- ===== MAIN PAGE ===== -->
+    <div id="userMainPage">
+      ${isLoggedIn || (accounts.length > 0) ? `
+        <div class="user-status-bar" id="userStatusBar">
+          <div class="flex-between">
+            <span id="userLoggedInAs" class="text-dim">${accountName ? `👤 ${escHtml(accountName)}` : 'Not logged in'}</span>
+            <span class="status-badge ${isLoggedIn ? 'connected' : 'disconnected'}" id="userStatusBadge">
+              <span class="status-dot"></span>
+              <span id="userStatusText">${isLoggedIn ? 'Connected' : 'Not logged in'}</span>
+            </span>
           </div>
         </div>
-        <div class="form-group">
-          <label for="userPhone">Phone Number</label>
-          <input type="text" id="userPhone" placeholder="+1234567890" autocomplete="off" />
+      ` : `
+        <div class="card" style="text-align:center; padding:32px;">
+          <p style="font-size:1.1rem; margin-bottom:12px;">🔐 No account configured</p>
+          <p class="text-dim" style="margin-bottom:16px;">Go to Settings to add your Telegram account.</p>
+          <button class="btn-primary" id="btnGoToSettings" style="width:auto; padding:10px 28px;">⚙️ Open Settings</button>
         </div>
-        <p class="hint">Enter your phone number with country code. You'll receive a code in Telegram.</p>
-        <button class="btn-primary mt-12" id="btnUserLogin">🔑 Login</button>
-      </div>
-      <div id="userCodeForm" class="hidden">
-        <div class="form-group">
-          <label for="userCode">Verification Code</label>
-          <input type="text" id="userCode" placeholder="12345" autocomplete="off" />
+      `}
+
+      <!-- Chat List -->
+      <div class="card hidden" id="userChatsCard">
+        <div class="flex-between mb-8">
+          <h2><span class="icon">💬</span> Chats</h2>
+          <div style="display:flex;gap:4px;">
+            <button class="btn-outline btn-sm" id="btnRefreshChats">🔄</button>
+            <button class="btn-outline btn-sm" id="btnClearReloadChats">🗑️</button>
+          </div>
         </div>
-        <p class="hint">Enter the code sent to your Telegram app.</p>
-        <button class="btn-primary mt-12" id="btnUserSubmitCode">✅ Submit Code</button>
-      </div>
-      <div id="user2FAForm" class="hidden">
-        <div class="form-group">
-          <label for="user2FA">Two-Factor Password</label>
-          <input type="password" id="user2FA" placeholder="Your 2FA password" autocomplete="off" />
+        <div class="form-group" style="margin-bottom: 8px;">
+          <input type="text" id="chatSearch" placeholder="🔍 Search chats..." style="padding: 8px 12px; font-size: 0.88rem;" />
         </div>
-        <button class="btn-primary mt-12" id="btnUserSubmit2FA">🔒 Submit</button>
+        <div style="display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap;">
+          <button class="btn-outline btn-sm chat-filter-btn active" data-filter="all" style="font-size:0.75rem; padding:4px 10px;">All</button>
+          <button class="btn-outline btn-sm chat-filter-btn" data-filter="user" style="font-size:0.75rem; padding:4px 10px;">👤 Private</button>
+          <button class="btn-outline btn-sm chat-filter-btn" data-filter="group" style="font-size:0.75rem; padding:4px 10px;">👥 Groups</button>
+          <button class="btn-outline btn-sm chat-filter-btn" data-filter="channel" style="font-size:0.75rem; padding:4px 10px;">📢 Channels</button>
+        </div>
+        <div id="chatList" style="max-height: 400px; overflow-y: auto;">
+          <p class="text-dim">Loading chats...</p>
+        </div>
       </div>
-      <div id="userLoggedInBar" class="hidden mt-12">
-        <div class="flex-between">
-          <span id="userLoggedInAs" class="text-dim">Logged in</span>
-          <div style="display: flex; gap: 8px;">
+
+      <!-- Message Viewer -->
+      <div class="card hidden" id="userMessagesCard">
+        <div class="flex-between mb-8">
+          <h2><span class="icon">📝</span> <span id="chatTitle">Messages</span></h2>
+          <button class="btn-outline btn-sm" id="btnBackToChats">← Back</button>
+        </div>
+        <div id="messageList" style="max-height: 500px; overflow-y: auto; padding: 4px 0;">
+          <p class="text-dim">Select a chat</p>
+        </div>
+        <div id="userProgressBox" class="hidden">
+          <div class="progress-container">
+            <div class="progress-bar-bg"><div class="progress-bar-fill" id="userProgressBar"></div></div>
+            <div class="progress-info">
+              <span id="userProgressPercent">0%</span>
+              <span id="userProgressSpeed">--</span>
+            </div>
+          </div>
+        </div>
+        <div class="reply-input-row mt-12">
+          <input type="text" id="userMsgInput" placeholder="Type a message..." />
+          <button class="btn-primary btn-sm" id="btnUserSend">Send</button>
+        </div>
+      </div>
+
+      <!-- Log -->
+      <div class="card">
+        <div class="flex-between mb-8">
+          <h2><span class="icon">📋</span> Log</h2>
+          <button class="btn-outline btn-sm" id="btnUserClearLog">Clear</button>
+        </div>
+        <div class="log-container" id="userLogContainer"></div>
+      </div>
+    </div>
+
+    <!-- ===== SETTINGS PAGE ===== -->
+    <!-- Settings Log (mirrors main log) -->
+    <div id="userSettingsPage" class="hidden">
+
+      <!-- Account Switcher -->
+      ${accounts.length > 0 ? renderAccountSwitcher(accounts, activeIdx) : ''}
+
+      <!-- Auth Card -->
+      <div class="card" id="userAuthCard">
+        <div class="flex-between mb-8">
+          <h2><span class="icon">🔐</span> User Login</h2>
+          <span class="status-badge ${isLoggedIn ? 'connected' : 'disconnected'}" id="userStatusBadge2">
+            <span class="status-dot"></span>
+            <span id="userStatusText2">${isLoggedIn ? 'Connected' : 'Not logged in'}</span>
+          </span>
+        </div>
+        <div id="userAuthForm" ${isLoggedIn ? 'class="hidden"' : ''}>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="userApiId">API ID</label>
+              <input type="text" id="userApiId" placeholder="12345678" autocomplete="off" value="${escHtml(getLastCreds().apiId)}" />
+            </div>
+            <div class="form-group">
+              <label for="userApiHash">API Hash</label>
+              <input type="password" id="userApiHash" placeholder="abc123def456..." autocomplete="off" value="${escHtml(getLastCreds().apiHash)}" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="userPhone">Phone Number</label>
+            <input type="text" id="userPhone" placeholder="+1234567890" autocomplete="off" />
+          </div>
+          <p class="hint">Enter your phone number with country code. You'll receive a code in Telegram.</p>
+          <button class="btn-primary mt-12" id="btnUserLogin">🔑 Login</button>
+        </div>
+        <div id="userCodeForm" class="hidden">
+          <div class="form-group">
+            <label for="userCode">Verification Code</label>
+            <input type="text" id="userCode" placeholder="12345" autocomplete="off" />
+          </div>
+          <p class="hint">Enter the code sent to your Telegram app.</p>
+          <button class="btn-primary mt-12" id="btnUserSubmitCode">✅ Submit Code</button>
+        </div>
+        <div id="user2FAForm" class="hidden">
+          <div class="form-group">
+            <label for="user2FA">Two-Factor Password</label>
+            <input type="password" id="user2FA" placeholder="Your 2FA password" autocomplete="off" />
+          </div>
+          <button class="btn-primary mt-12" id="btnUserSubmit2FA">🔒 Submit</button>
+        </div>
+        <div id="userLoggedInBar" ${isLoggedIn ? '' : 'class="hidden"'} style="margin-top:12px;">
+          <div class="flex-between">
+            <span id="userLoggedInAs2" class="text-dim">${accountName ? `👤 ${escHtml(accountName)}` : 'Logged in'}</span>
             <button class="btn-danger btn-sm" id="btnUserLogout">🚪 Logout</button>
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- Chat List -->
-    <div class="card hidden" id="userChatsCard">
-      <div class="flex-between mb-8">
-        <h2><span class="icon">💬</span> Chats</h2>
-        <div style="display:flex;gap:4px;">
-          <button class="btn-outline btn-sm" id="btnRefreshChats">🔄 Refresh</button>
-          <button class="btn-outline btn-sm" id="btnClearReloadChats">🗑️ Clear</button>
+      <!-- User Settings -->
+      <div class="card" id="userSettingsCard">
+        <div class="flex-between mb-8">
+          <h2><span class="icon">⚙️</span> User Settings</h2>
+          <button class="btn-outline btn-sm" id="btnResetUserSettings">Reset Defaults</button>
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" id="userSettingsStealth" style="width: auto; accent-color: var(--warning);" />
+            <span>👻 Stealth Mode (avoid double tick)</span>
+          </label>
+          <p class="hint">Don't send read receipts when reading messages.</p>
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" id="userSettingsAutoPhotos" style="width: auto; accent-color: var(--primary);" />
+            <span>📷 Auto-load photo thumbnails</span>
+          </label>
+          <p class="hint">Automatically load photo previews in chats.</p>
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" id="userSettingsNotify" style="width: auto; accent-color: var(--success);" />
+            <span>🔔 Notify on new messages</span>
+          </label>
+          <p class="hint">Browser notifications for new messages.</p>
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" id="userSettingsEnterSend" style="width: auto; accent-color: var(--primary);" />
+            <span>⏎ Send with Enter</span>
+          </label>
+          <p class="hint">Press Enter to send (uncheck for Ctrl+Enter).</p>
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" id="userSettingsProxy" style="width: auto; accent-color: var(--primary);" />
+            <span>🌐 Enable Cloudflare Proxy</span>
+          </label>
+          <p class="hint">Route connections through a CF Worker proxy.</p>
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label for="userSettingsProxyDomain">Proxy Worker Domain</label>
+          <input type="text" id="userSettingsProxyDomain" placeholder="tg-ws-api.your-account.workers.dev" style="background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; color: var(--text); font-size: 0.88rem;" />
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label for="userSettingsFontSize">Font Size</label>
+          <select id="userSettingsFontSize" style="background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; color: var(--text); font-size: 0.95rem; width: 100%;">
+            <option value="small">Small</option>
+            <option value="normal">Normal</option>
+            <option value="large">Large</option>
+          </select>
+        </div>
+        <div class="mt-12">
+          <button class="btn-primary btn-sm" id="btnSaveUserSettings" style="width: auto;">💾 Save Settings</button>
+          <span class="text-dim" id="userSettingsSaveStatus" style="margin-left: 8px;"></span>
         </div>
       </div>
-      <div class="form-group" style="margin-bottom: 8px;">
-        <input type="text" id="chatSearch" placeholder="🔍 Search chats..." style="padding: 8px 12px; font-size: 0.88rem;" />
-      </div>
-      <div style="display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap;">
-        <button class="btn-outline btn-sm chat-filter-btn active" data-filter="all" style="font-size:0.75rem; padding:4px 10px;">All</button>
-        <button class="btn-outline btn-sm chat-filter-btn" data-filter="user" style="font-size:0.75rem; padding:4px 10px;">👤 Private</button>
-        <button class="btn-outline btn-sm chat-filter-btn" data-filter="group" style="font-size:0.75rem; padding:4px 10px;">👥 Groups</button>
-        <button class="btn-outline btn-sm chat-filter-btn" data-filter="channel" style="font-size:0.75rem; padding:4px 10px;">📢 Channels</button>
-      </div>
-      <div id="chatList" style="max-height: 400px; overflow-y: auto;">
-        <p class="text-dim">Loading chats...</p>
-      </div>
-    </div>
 
-    <!-- Message Viewer -->
-    <div class="card hidden" id="userMessagesCard">
-      <div class="flex-between mb-8">
-        <h2><span class="icon">📝</span> <span id="chatTitle">Messages</span></h2>
-        <button class="btn-outline btn-sm" id="btnBackToChats">← Back</button>
-      </div>
-      <div id="messageList" style="max-height: 500px; overflow-y: auto; padding: 4px 0;">
-        <p class="text-dim">Select a chat</p>
-      </div>
-      <div id="userProgressBox" class="hidden">
-        <div class="progress-container">
-          <div class="progress-bar-bg"><div class="progress-bar-fill" id="userProgressBar"></div></div>
-          <div class="progress-info">
-            <span id="userProgressPercent">0%</span>
-            <span id="userProgressSpeed">--</span>
-          </div>
+      <!-- Settings Log -->
+      <div class="card">
+        <div class="flex-between mb-8">
+          <h2><span class="icon">📋</span> Log</h2>
+          <button class="btn-outline btn-sm" id="btnSettingsClearLog">Clear</button>
         </div>
+        <div class="log-container" id="settingsLogContainer"></div>
       </div>
-      <div class="reply-input-row mt-12">
-        <input type="text" id="userMsgInput" placeholder="Type a message..." />
-        <button class="btn-primary btn-sm" id="btnUserSend">Send</button>
-      </div>
-    </div>
 
-    <!-- Log -->
-    <div class="card">
-      <div class="flex-between mb-8">
-        <h2><span class="icon">📋</span> Log</h2>
-        <div style="display: flex; gap: 8px;">
-          <button class="btn-outline btn-sm" id="btnUserClearLog">Clear</button>
-          <button class="btn-outline btn-sm" id="btnSwitchToBot">🤖 Bot Mode</button>
-        </div>
+      <div style="text-align:center; margin-top:16px;">
+        <button class="btn-primary" id="btnBackToMain" style="width:auto; padding:10px 32px;">← Back to Chats</button>
       </div>
-      <div class="log-container" id="userLogContainer"></div>
     </div>
 
     <p style="text-align: center; margin-top: 24px; font-size: 0.75rem; color: var(--text-dim);">
@@ -152,38 +280,121 @@ export function renderUserMode(container, addLog, switchMode) {
     </p>
   `;
 
-  // Bind events
+  loadUserSettingsUI();
   bindUserEvents(addLog, switchMode);
 
-  // Check for saved session and auto-reconnect
-  const tempClient = new TGUserClient(() => {}, () => {});
-  if (tempClient.hasSession() && tempClient.getSavedCredentials()) {
-    addLog('info', 'Found saved user session. Reconnecting...');
-    autoReconnectUser(addLog);
+  // Check for interrupted auth (e.g. refreshed during 2FA step)
+  const authProgress = getAuthProgress();
+  if (authProgress && authProgress.step === 'need_2fa') {
+    addLog('info', 'Resuming login (2FA step)...');
+    showPage('settings');
+    resumeAuthFrom2FA(authProgress);
+  } else {
+    // Auto-reconnect
+    const tempClient = new TGUserClient(() => {}, () => {});
+    if (tempClient.hasSession() && tempClient.getSavedCredentials()) {
+      addLog('info', 'Found saved user session. Reconnecting...');
+      autoReconnectUser(addLog);
+    } else if (accounts.length === 0) {
+      showPage('settings');
+    }
   }
 }
 
+// ===== Page Navigation =====
+
+function showPage(page) {
+  _currentPage = page;
+  const mainEl = document.getElementById('userMainPage');
+  const settingsEl = document.getElementById('userSettingsPage');
+  if (page === 'settings') {
+    mainEl?.classList.add('hidden');
+    settingsEl?.classList.remove('hidden');
+  } else {
+    mainEl?.classList.remove('hidden');
+    settingsEl?.classList.add('hidden');
+  }
+}
+
+function renderAccountSwitcher(accounts, activeIdx) {
+  const activeAccount = accounts.find(a => a.idx === activeIdx);
+  const canAddMore = accounts.length < 10;
+
+  let optionsHtml = accounts.map(a => {
+    const isActive = a.idx === activeIdx;
+    return `<div class="account-option ${isActive ? 'active' : ''}" data-account-idx="${a.idx}">
+      <span class="account-option-name">${escHtml(a.name || 'Unknown')}</span>
+      <span class="account-option-detail">${escHtml(a.phone || '')} ${a.username ? `@${a.username}` : ''}</span>
+      ${isActive ? '<span class="account-option-check">✓</span>' : ''}
+    </div>`;
+  }).join('');
+
+  if (canAddMore) {
+    optionsHtml += `<div class="account-option add-account" id="btnAddAccountDropdown">
+      <span class="account-option-name">➕ Add Account</span>
+      <span class="account-option-detail">Up to 10 accounts</span>
+    </div>`;
+  }
+
+  return `
+    <div class="card account-switcher-card" id="accountSwitcherCard">
+      <div class="flex-between">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-size:1.1rem;">👥</span>
+          <div>
+            <div style="font-weight:600; font-size:0.9rem;">${escHtml(activeAccount?.name || 'No account')}</div>
+            <div class="text-dim" style="font-size:0.75rem;">${escHtml(activeAccount?.phone || '')} ${activeAccount?.username ? `@${activeAccount.username}` : ''}</div>
+          </div>
+        </div>
+        <button class="btn-outline btn-sm" id="btnToggleAccountDropdown">
+          ${accounts.length} account${accounts.length !== 1 ? 's' : ''} ▾
+        </button>
+      </div>
+      <div class="account-dropdown hidden" id="accountDropdown">
+        ${optionsHtml}
+      </div>
+    </div>
+  `;
+}
+
 function userLog(type, msg) {
-  const container = document.getElementById('userLogContainer');
-  if (!container) return;
   const time = new Date().toLocaleTimeString();
-  const entry = document.createElement('div');
-  entry.className = `log-entry ${type}`;
-  entry.textContent = `[${time}] ${msg}`;
-  container.appendChild(entry);
-  container.scrollTop = container.scrollHeight;
+  const text = `[${time}] ${msg}`;
+  // Write to both log containers (main + settings)
+  ['userLogContainer', 'settingsLogContainer'].forEach(id => {
+    const container = document.getElementById(id);
+    if (!container) return;
+    const entry = document.createElement('div');
+    entry.className = `log-entry ${type}`;
+    entry.textContent = text;
+    container.appendChild(entry);
+    container.scrollTop = container.scrollHeight;
+  });
 }
 
 function setUserStatus(status) {
-  const badge = document.getElementById('userStatusBadge');
-  const text = document.getElementById('userStatusText');
-  if (badge) badge.className = `status-badge ${status}`;
-  if (text) text.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+  ['userStatusBadge', 'userStatusBadge2'].forEach(id => {
+    const badge = document.getElementById(id);
+    if (badge) badge.className = `status-badge ${status}`;
+  });
+  ['userStatusText', 'userStatusText2'].forEach(id => {
+    const text = document.getElementById(id);
+    if (text) text.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+  });
 }
 
 function bindUserEvents(addLog, switchMode) {
+  // Page navigation
+  document.getElementById('btnUserSettings')?.addEventListener('click', () => showPage('settings'));
+  document.getElementById('btnBackToMain')?.addEventListener('click', () => showPage('main'));
+  document.getElementById('btnGoToSettings')?.addEventListener('click', () => showPage('settings'));
+  document.getElementById('btnSwitchToBot')?.addEventListener('click', () => switchMode('bot'));
+
+  // Auth
   document.getElementById('btnUserLogin')?.addEventListener('click', () => handleUserLogin());
-  document.getElementById('btnUserLogout')?.addEventListener('click', () => handleUserLogout());
+  document.getElementById('btnUserLogout')?.addEventListener('click', () => handleUserLogout(addLog, switchMode));
+
+  // Chats
   document.getElementById('btnRefreshChats')?.addEventListener('click', () => loadDialogs());
   document.getElementById('btnClearReloadChats')?.addEventListener('click', () => {
     dialogsCache = [];
@@ -194,39 +405,163 @@ function bindUserEvents(addLog, switchMode) {
   document.getElementById('btnBackToChats')?.addEventListener('click', () => {
     document.getElementById('userMessagesCard')?.classList.add('hidden');
     document.getElementById('userChatsCard')?.classList.remove('hidden');
-    currentEntity = null;
-    currentDialogId = null;
-    currentDialogTitle = null;
+    currentEntity = null; currentDialogId = null; currentDialogTitle = null;
     saveUIState();
   });
+
+  // Send
   document.getElementById('btnUserSend')?.addEventListener('click', () => handleUserSendMessage());
   document.getElementById('userMsgInput')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleUserSendMessage(); }
+    const settings = getUserSettings();
+    const sendOnEnter = settings.sendWithEnter !== false;
+    if (sendOnEnter) {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleUserSendMessage(); }
+    } else {
+      if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); handleUserSendMessage(); }
+    }
   });
+
+  // Log (clear both)
   document.getElementById('btnUserClearLog')?.addEventListener('click', () => {
     document.getElementById('userLogContainer').innerHTML = '';
+    document.getElementById('settingsLogContainer').innerHTML = '';
   });
-  document.getElementById('btnSwitchToBot')?.addEventListener('click', () => {
-    switchMode('bot');
+  document.getElementById('btnSettingsClearLog')?.addEventListener('click', () => {
+    document.getElementById('userLogContainer').innerHTML = '';
+    document.getElementById('settingsLogContainer').innerHTML = '';
   });
-  document.getElementById('chatSearch')?.addEventListener('input', (e) => {
-    filterDialogs(e.target.value.toLowerCase());
-  });
-  // Chat type filter tabs
+
+  // Search & filters
+  document.getElementById('chatSearch')?.addEventListener('input', (e) => filterDialogs(e.target.value.toLowerCase()));
   document.querySelectorAll('.chat-filter-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.chat-filter-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      const filter = btn.dataset.filter;
-      filterDialogsByType(filter);
+      filterDialogsByType(btn.dataset.filter);
       saveUIState();
     });
   });
+
+  // Account switcher
+  document.getElementById('btnToggleAccountDropdown')?.addEventListener('click', () => {
+    document.getElementById('accountDropdown')?.classList.toggle('hidden');
+  });
+  document.querySelectorAll('.account-option:not(.add-account)').forEach(opt => {
+    opt.addEventListener('click', () => {
+      const idx = parseInt(opt.dataset.accountIdx);
+      if (idx !== getActiveAccountIndex()) switchAccount(idx, addLog, switchMode);
+      document.getElementById('accountDropdown')?.classList.add('hidden');
+    });
+  });
+  document.getElementById('btnAddAccountDropdown')?.addEventListener('click', () => {
+    document.getElementById('accountDropdown')?.classList.add('hidden');
+    startAddAccount();
+  });
+
+  // User Settings
+  document.getElementById('btnSaveUserSettings')?.addEventListener('click', handleSaveUserSettings);
+  document.getElementById('btnResetUserSettings')?.addEventListener('click', handleResetUserSettings);
+}
+
+// ===== Multi-Account =====
+
+let _pendingAccountIndex = null;
+
+function startAddAccount() {
+  const nextIdx = getNextSessionIndex();
+  if (nextIdx < 0) { userLog('error', 'Maximum 10 accounts reached.'); return; }
+  _pendingAccountIndex = nextIdx;
+  userLog('info', `Adding new account (slot #${nextIdx}).`);
+
+  document.getElementById('userLoggedInBar')?.classList.add('hidden');
+  document.getElementById('userAuthForm')?.classList.remove('hidden');
+  document.getElementById('userCodeForm')?.classList.add('hidden');
+  document.getElementById('user2FAForm')?.classList.add('hidden');
+
+  // Auto-fill API creds from last account
+  const creds = getLastCreds();
+  const apiIdEl = document.getElementById('userApiId');
+  const apiHashEl = document.getElementById('userApiHash');
+  const phoneEl = document.getElementById('userPhone');
+  if (apiIdEl) apiIdEl.value = creds.apiId;
+  if (apiHashEl) apiHashEl.value = creds.apiHash;
+  if (phoneEl) { phoneEl.value = ''; phoneEl.focus(); }
+}
+
+async function switchAccount(targetIdx, addLog, switchMode) {
+  userLog('info', `Switching to account #${targetIdx}...`);
+  setUserStatus('connecting');
+  if (userClient) { await userClient.disconnect(); userClient = null; }
+  dialogsCache = []; currentEntity = null; currentDialogId = null; currentDialogTitle = null;
+  thumbCache.clear(); rawMessageCache.clear();
+  setActiveAccountIndex(targetIdx);
+  const app = document.getElementById('app');
+  if (app) renderUserMode(app, addLog, switchMode);
 }
 
 // ===== Auth Flow =====
 let _resolveCode = null;
 let _resolvePassword = null;
+const AUTH_PROGRESS_KEY = 'tgcf_auth_progress';
+
+/** Save auth progress so we can resume after refresh */
+function saveAuthProgress(data) {
+  sessionStorage.setItem(AUTH_PROGRESS_KEY, JSON.stringify(data));
+}
+function getAuthProgress() {
+  try { return JSON.parse(sessionStorage.getItem(AUTH_PROGRESS_KEY)); } catch { return null; }
+}
+function clearAuthProgress() {
+  sessionStorage.removeItem(AUTH_PROGRESS_KEY);
+}
+
+/**
+ * Resume auth from 2FA step after a page refresh.
+ * GramJS session was saved after OTP, so we just need to reconnect and ask for password.
+ */
+async function resumeAuthFrom2FA(progress) {
+  const { apiId, apiHash, phone, accountIndex } = progress;
+  setUserStatus('connecting');
+  userLog('info', 'Reconnecting to resume 2FA authentication...');
+
+  // Show 2FA form directly
+  document.getElementById('userAuthForm')?.classList.add('hidden');
+  document.getElementById('userCodeForm')?.classList.add('hidden');
+  document.getElementById('user2FAForm')?.classList.remove('hidden');
+  document.getElementById('user2FA')?.focus();
+
+  try {
+    userClient = new TGUserClient(userLog, updateUserProgress, accountIndex);
+    await userClient.init(apiId, apiHash);
+
+    const phonePromise = () => Promise.resolve(phone);
+    const codePromise = () => Promise.resolve(''); // OTP already done — GramJS will skip
+    const passwordPromise = () => new Promise((resolve) => {
+      _resolvePassword = resolve;
+      document.getElementById('btnUserSubmit2FA')?.addEventListener('click', () => {
+        const pw = document.getElementById('user2FA')?.value.trim();
+        if (pw && _resolvePassword) {
+          const pwBtn = document.getElementById('btnUserSubmit2FA');
+          if (pwBtn) { pwBtn.disabled = true; pwBtn.innerHTML = '⏳ Authenticating...'; }
+          setAuthInputsLocked(true);
+          _resolvePassword(pw); _resolvePassword = null;
+        }
+      }, { once: true });
+    });
+
+    await userClient.authenticate(phonePromise, codePromise, passwordPromise);
+    clearAuthProgress();
+    onUserLoggedIn();
+    showPage('main');
+  } catch (error) {
+    setUserStatus('disconnected');
+    userLog('error', `2FA login failed: ${error.message}`);
+    setAuthInputsLocked(false);
+    // Reset 2FA button
+    const pwBtn = document.getElementById('btnUserSubmit2FA');
+    if (pwBtn) { pwBtn.disabled = false; pwBtn.innerHTML = '🔒 Submit'; }
+  }
+}
 
 async function handleUserLogin() {
   const apiId = document.getElementById('userApiId')?.value.trim();
@@ -238,39 +573,65 @@ async function handleUserLogin() {
   btn.disabled = true; btn.innerHTML = '⏳ Connecting...';
   setUserStatus('connecting');
 
+  // Lock inputs during processing
+  setAuthInputsLocked(true);
+
+  const accountIndex = _pendingAccountIndex !== null ? _pendingAccountIndex : getActiveAccountIndex();
+  _pendingAccountIndex = null;
+
   try {
-    userClient = new TGUserClient(userLog, updateUserProgress);
+    userClient = new TGUserClient(userLog, updateUserProgress, accountIndex);
     await userClient.init(apiId, apiHash);
 
-    // Start auth — GramJS will call these callbacks
     const phonePromise = () => Promise.resolve(phone);
     const codePromise = () => new Promise((resolve) => {
       _resolveCode = resolve;
+      setAuthInputsLocked(false); // Unlock for code entry
       document.getElementById('userAuthForm')?.classList.add('hidden');
       document.getElementById('userCodeForm')?.classList.remove('hidden');
       document.getElementById('userCode')?.focus();
       document.getElementById('btnUserSubmitCode')?.addEventListener('click', () => {
         const code = document.getElementById('userCode')?.value.trim();
-        if (code && _resolveCode) { _resolveCode(code); _resolveCode = null; }
+        if (code && _resolveCode) {
+          const codeBtn = document.getElementById('btnUserSubmitCode');
+          if (codeBtn) { codeBtn.disabled = true; codeBtn.innerHTML = '⏳ Verifying...'; }
+          _resolveCode(code); _resolveCode = null;
+        }
       }, { once: true });
     });
     const passwordPromise = () => new Promise((resolve) => {
       _resolvePassword = resolve;
+      // Save progress so refresh can resume from 2FA directly
+      saveAuthProgress({ step: 'need_2fa', apiId, apiHash, phone, accountIndex });
+      setAuthInputsLocked(false); // Unlock for 2FA entry
       document.getElementById('userCodeForm')?.classList.add('hidden');
       document.getElementById('user2FAForm')?.classList.remove('hidden');
       document.getElementById('user2FA')?.focus();
       document.getElementById('btnUserSubmit2FA')?.addEventListener('click', () => {
         const pw = document.getElementById('user2FA')?.value.trim();
-        if (pw && _resolvePassword) { _resolvePassword(pw); _resolvePassword = null; }
+        if (pw && _resolvePassword) {
+          const pwBtn = document.getElementById('btnUserSubmit2FA');
+          if (pwBtn) { pwBtn.disabled = true; pwBtn.innerHTML = '⏳ Authenticating...'; }
+          setAuthInputsLocked(true);
+          _resolvePassword(pw); _resolvePassword = null;
+        }
       }, { once: true });
     });
 
     await userClient.authenticate(phonePromise, codePromise, passwordPromise);
+    clearAuthProgress();
     onUserLoggedIn();
+    // Switch to main page after login
+    showPage('main');
   } catch (error) {
     setUserStatus('disconnected');
     userLog('error', `Login failed: ${error.message}`);
     btn.innerHTML = '🔑 Login';
+    setAuthInputsLocked(false);
+    // Don't clear auth progress on PASSWORD_HASH_INVALID — let them retry
+    if (!error.message?.includes('PASSWORD_HASH_INVALID')) {
+      clearAuthProgress();
+    }
   } finally {
     btn.disabled = false;
   }
@@ -295,19 +656,25 @@ async function autoReconnectUser(addLog) {
 
 function onUserLoggedIn() {
   setUserStatus('connected');
-  // Hide auth form, show logged-in bar
   document.getElementById('userAuthForm')?.classList.add('hidden');
   document.getElementById('userCodeForm')?.classList.add('hidden');
   document.getElementById('user2FAForm')?.classList.add('hidden');
   document.getElementById('userLoggedInBar')?.classList.remove('hidden');
-  const nameEl = document.getElementById('userLoggedInAs');
-  if (nameEl && userClient.me) {
-    nameEl.textContent = `👤 ${userClient.me.firstName || ''} ${userClient.me.lastName || ''} (@${userClient.me.username || 'N/A'})`;
-  }
-  // Show chats
+
+  const name = userClient.me ? `${userClient.me.firstName || ''} ${userClient.me.lastName || ''}`.trim() : '';
+  const username = userClient.me?.username || 'N/A';
+  ['userLoggedInAs', 'userLoggedInAs2'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = `👤 ${name} (@${username})`;
+  });
+
+  // Show chats on main page
   document.getElementById('userChatsCard')?.classList.remove('hidden');
+  // Update status bar
+  const statusBar = document.getElementById('userStatusBar');
+  if (statusBar) statusBar.classList.remove('hidden');
+
   loadDialogs().then(() => {
-    // Restore saved UI state (filter, open chat)
     const ui = getUIState();
     if (ui.filter && ui.filter !== 'all') {
       document.querySelectorAll('.chat-filter-btn').forEach(b => b.classList.remove('active'));
@@ -319,51 +686,62 @@ function onUserLoggedIn() {
       if (d) openChat(d);
     }
   });
+
   // Listen for new messages
   userClient.startListening((msg) => {
-    // Build all possible ID forms for matching
     const peer = msg.message?.peerId;
     const possibleIds = [];
-    if (peer?.channelId) {
-      const cid = peer.channelId.toString();
-      possibleIds.push(cid, `-100${cid}`, `-${cid}`);
-    }
-    if (peer?.chatId) {
-      const gid = peer.chatId.toString();
-      possibleIds.push(gid, `-${gid}`, `-100${gid}`);
-    }
-    if (peer?.userId) {
-      possibleIds.push(peer.userId.toString());
-    }
+    if (peer?.channelId) { const c = peer.channelId.toString(); possibleIds.push(c, `-100${c}`, `-${c}`); }
+    if (peer?.chatId) { const g = peer.chatId.toString(); possibleIds.push(g, `-${g}`, `-100${g}`); }
+    if (peer?.userId) possibleIds.push(peer.userId.toString());
     if (msg.senderId) possibleIds.push(msg.senderId.toString());
 
-    // Update chat list preview for this dialog
     const matchedDialog = dialogsCache.find(d => possibleIds.includes(d.id));
     if (matchedDialog) {
       matchedDialog.lastMessage = msg.text || (msg.media ? '[Media]' : '');
       matchedDialog.date = msg.date || new Date();
-      // Increment unread count if this chat is NOT currently open
       if (!currentDialogId || !possibleIds.includes(currentDialogId)) {
         matchedDialog.unreadCount = (matchedDialog.unreadCount || 0) + 1;
       }
-      // Re-render chat list with current filter
       const activeFilter = document.querySelector('.chat-filter-btn.active')?.dataset?.filter || 'all';
       filterDialogsByType(activeFilter);
     }
 
-    // Append to open chat if matching
     if (currentEntity && currentDialogId && possibleIds.includes(currentDialogId)) {
       appendUserMessage(msg);
       if (msg.id) userClient.markAsRead(currentEntity, msg.id).catch(() => {});
     }
+
+    const settings = getUserSettings();
+    if (settings.notifyNewMessages && !document.hasFocus()) {
+      try {
+        if (Notification.permission === 'granted') new Notification('New message', { body: msg.text || '[Media]' });
+        else if (Notification.permission !== 'denied') Notification.requestPermission();
+      } catch {}
+    }
   });
 }
 
-async function handleUserLogout() {
+async function handleUserLogout(addLog, switchMode) {
   if (userClient) {
-    userClient.clearSession();
-    await userClient.disconnect();
+    userLog('info', `Logging out...`);
+    try { await userClient.logout(); } catch (e) {
+      userClient.clearSession();
+      try { await userClient.disconnect(); } catch {}
+    }
     userClient = null;
+    dialogsCache = []; currentEntity = null; currentDialogId = null; currentDialogTitle = null;
+    thumbCache.clear(); rawMessageCache.clear();
+    localStorage.removeItem(USER_UI_KEY);
+
+    const remaining = getAccounts();
+    if (remaining.length > 0) {
+      setActiveAccountIndex(remaining[0].idx);
+      const app = document.getElementById('app');
+      renderUserMode(app, addLog || userLog, switchMode || (() => {}));
+      return;
+    }
+    localStorage.removeItem('tgcf_active_account');
   }
   setUserStatus('disconnected');
   document.getElementById('userLoggedInBar')?.classList.add('hidden');
@@ -379,10 +757,8 @@ async function loadDialogs() {
   if (!userClient || !userClient.connected) return;
   const list = document.getElementById('chatList');
   if (list) list.innerHTML = '<p class="text-dim">Loading...</p>';
-
   try {
     dialogsCache = await userClient.getDialogs(100);
-    // Apply active filter after loading
     const activeFilter = document.querySelector('.chat-filter-btn.active')?.dataset?.filter || 'all';
     filterDialogsByType(activeFilter);
   } catch (e) {
@@ -395,7 +771,6 @@ function renderDialogs(dialogs) {
   const list = document.getElementById('chatList');
   if (!list) return;
   list.innerHTML = '';
-
   for (const d of dialogs) {
     const item = document.createElement('div');
     item.className = 'msg-item convo-item';
@@ -416,50 +791,27 @@ function renderDialogs(dialogs) {
     item.addEventListener('click', () => openChat(d));
     list.appendChild(item);
   }
-
-  if (dialogs.length === 0) {
-    list.innerHTML = '<p class="text-dim">No chats found.</p>';
-  }
+  if (dialogs.length === 0) list.innerHTML = '<p class="text-dim">No chats found.</p>';
 }
 
 function filterDialogs(query) {
-  if (!query) {
-    renderDialogs(dialogsCache);
-    return;
-  }
-  const filtered = dialogsCache.filter(d => d.title.toLowerCase().includes(query));
-  renderDialogs(filtered);
+  if (!query) { renderDialogs(dialogsCache); return; }
+  renderDialogs(dialogsCache.filter(d => d.title.toLowerCase().includes(query)));
 }
-
 function filterDialogsByType(type) {
-  if (type === 'all') {
-    renderDialogs(dialogsCache);
-    return;
-  }
-  const filtered = dialogsCache.filter(d => {
-    if (type === 'user') return d.isUser;
-    if (type === 'group') return d.isGroup;
-    if (type === 'channel') return d.isChannel;
-    return true;
-  });
-  renderDialogs(filtered);
+  if (type === 'all') { renderDialogs(dialogsCache); return; }
+  renderDialogs(dialogsCache.filter(d => type === 'user' ? d.isUser : type === 'group' ? d.isGroup : type === 'channel' ? d.isChannel : true));
 }
 
 // ===== Chat Viewer =====
 
 async function openChat(dialog) {
-  currentEntity = dialog.entity;
-  currentDialogId = dialog.id;
-  currentDialogTitle = dialog.title;
-  userReplyToMsgId = null;
-  oldestMsgId = 0;
-  saveUIState();
-
+  currentEntity = dialog.entity; currentDialogId = dialog.id; currentDialogTitle = dialog.title;
+  userReplyToMsgId = null; oldestMsgId = 0; saveUIState();
   document.getElementById('userChatsCard')?.classList.add('hidden');
   document.getElementById('userMessagesCard')?.classList.remove('hidden');
   document.getElementById('chatTitle').textContent = dialog.title;
   document.getElementById('messageList').innerHTML = '<p class="text-dim">Loading messages...</p>';
-  // Check if we can write in this chat
   const canWrite = !dialog.isChannel || (dialog.entity?.adminRights || dialog.entity?.creator);
   const inputRow = document.querySelector('#userMessagesCard .reply-input-row');
   if (inputRow) inputRow.style.display = canWrite ? '' : 'none';
@@ -469,237 +821,267 @@ async function openChat(dialog) {
     const messages = await userClient.getMessages(currentEntity, 40);
     const list = document.getElementById('messageList');
     list.innerHTML = '';
-    // Build a map of id → text for reply previews
     const msgMap = {};
     for (const msg of messages) {
       msgMap[msg.id] = msg.text || (msg.media ? '[Media]' : '');
+      if (msg.message) rawMessageCache.set(msg.id, msg.message);
     }
-
-    // Messages come newest-first, reverse for display
     let maxId = 0;
     for (const msg of messages.reverse()) {
-      // Resolve reply preview text
-      if (msg.replyToMsgId && msgMap[msg.replyToMsgId]) {
-        msg.replyToText = msgMap[msg.replyToMsgId];
-      }
+      if (msg.replyToMsgId && msgMap[msg.replyToMsgId]) msg.replyToText = msgMap[msg.replyToMsgId];
       appendUserMessage(msg);
       if (msg.id > maxId) maxId = msg.id;
     }
-    // Track oldest message for pagination
-    if (messages.length > 0) {
-      oldestMsgId = messages[messages.length - 1].id; // newest-first, last = oldest
-    }
-
+    if (messages.length > 0) oldestMsgId = messages[messages.length - 1].id;
     list.scrollTop = list.scrollHeight;
-
-    // Scroll-up to load older messages
     list.addEventListener('scroll', handleScrollLoadOlder);
-
-    // Mark messages as read (respects stealth mode)
-    if (maxId > 0) {
-      userClient.markAsRead(currentEntity, maxId).catch(() => {});
-    }
+    if (maxId > 0) userClient.markAsRead(currentEntity, maxId).catch(() => {});
+    const settings = getUserSettings();
+    if (settings.autoDownloadPhotos) loadVisibleThumbnails();
   } catch (e) {
     userLog('error', `Failed to load messages: ${e.message}`);
     document.getElementById('messageList').innerHTML = '<p class="text-dim">Failed to load messages.</p>';
   }
 }
 
-// Load older messages when scrolling to top
 async function handleScrollLoadOlder() {
   const list = document.getElementById('messageList');
   if (!list || !userClient || !currentEntity || isLoadingOlder || oldestMsgId <= 0) return;
-  if (list.scrollTop > 50) return; // Only trigger near top
-
+  if (list.scrollTop > 50) return;
   isLoadingOlder = true;
   const prevHeight = list.scrollHeight;
-
   try {
     const older = await userClient.getMessages(currentEntity, 20, oldestMsgId);
-    if (older.length === 0) {
-      oldestMsgId = 0; // No more messages
-      isLoadingOlder = false;
-      return;
-    }
-
-    // Prepend older messages (they come newest-first)
+    if (older.length === 0) { oldestMsgId = 0; isLoadingOlder = false; return; }
     for (const msg of older) {
+      if (msg.message) rawMessageCache.set(msg.id, msg.message);
       prependUserMessage(msg);
       if (msg.id < oldestMsgId || oldestMsgId === 0) oldestMsgId = msg.id;
     }
-
-    // Maintain scroll position
     list.scrollTop = list.scrollHeight - prevHeight;
-  } catch {} 
-  finally { isLoadingOlder = false; }
+    const settings = getUserSettings();
+    if (settings.autoDownloadPhotos) loadVisibleThumbnails();
+  } catch {} finally { isLoadingOlder = false; }
 }
 
-function prependUserMessage(msg) {
-  const list = document.getElementById('messageList');
-  if (!list) return;
+function prependUserMessage(msg) { const list = document.getElementById('messageList'); if (list) list.prepend(createMessageElement(msg)); }
+
+function appendUserMessage(msg) {
+  const list = document.getElementById('messageList'); if (!list) return;
+  const ph = list.querySelector(':scope > p.text-dim'); if (ph) ph.remove();
+  if (msg.message) rawMessageCache.set(msg.id, msg.message);
+  list.appendChild(createMessageElement(msg));
+  list.scrollTop = list.scrollHeight;
+}
+
+function createMessageElement(msg) {
   const div = document.createElement('div');
-  const time = smartDate(msg.date);
-  const isOut = msg.out;
-  const replyBar = renderReplyBar(msg);
   div.id = `msg_${msg.id}`;
-  if (isOut) {
+  const time = smartDate(msg.date);
+  const replyBar = renderReplyBar(msg);
+  const mediaHtml = msg.media ? renderMediaContent(msg) : '';
+  if (msg.out) {
     div.className = 'reply-sent';
-    div.innerHTML = `${replyBar}${msg.text ? `<div class="reply-sent-text">${escHtml(msg.text)}</div>` : ''}${msg.media ? renderMediaBadge(msg) : ''}<div class="reply-sent-time">${time}</div>`;
+    div.innerHTML = `${replyBar}${msg.text ? `<div class="reply-sent-text">${escHtml(msg.text)}</div>` : ''}${mediaHtml}<div class="reply-sent-time">${time}</div>`;
   } else {
     div.className = 'reply-received clickable-msg';
-    div.innerHTML = `${replyBar}${msg.media ? renderMediaBadge(msg) : ''}${msg.text ? `<div class="reply-received-text">${escHtml(msg.text)}</div>` : ''}<div class="reply-received-time">${time} • tap to reply ↩</div>`;
-    div.addEventListener('click', () => setUserReplyTo(msg.id, msg.text || '[Media]'));
+    div.innerHTML = `${replyBar}${mediaHtml}${msg.text ? `<div class="reply-received-text">${escHtml(msg.text)}</div>` : ''}<div class="reply-received-time">${time} • tap to reply ↩</div>`;
+    div.addEventListener('click', (e) => {
+      if (e.target.closest('.media-photo-container') || e.target.closest('.media-video-container') || e.target.closest('.media-file-container')) return;
+      setUserReplyTo(msg.id, msg.text || '[Media]');
+    });
   }
-  list.prepend(div);
+  return div;
+}
+
+// ===== Media =====
+
+function renderMediaContent(msg) {
+  const m = msg.media;
+  if (m.type === 'photo') return renderPhotoMedia(msg);
+  if (m.type === 'video' || m.type === 'video_note') return renderVideoMedia(msg);
+  if (m.type === 'voice' || m.type === 'audio') return renderAudioMedia(msg);
+  return renderFileMedia(msg);
+}
+
+function renderPhotoMedia(msg) {
+  const m = msg.media; const size = m.fileSize ? formatFileSize(m.fileSize) : ''; const cached = thumbCache.get(msg.id);
+  return `<div class="media-photo-container" data-msg-id="${msg.id}">${cached
+    ? `<img src="${cached}" class="media-photo-thumb" alt="📷" onclick="window._openPhotoLightbox(${msg.id})" />`
+    : `<div class="media-photo-placeholder" onclick="window._loadAndShowPhoto(${msg.id})"><span>📷</span><span class="media-photo-label">Photo ${size ? `(${size})` : ''}</span><span class="media-photo-load">Click to load</span></div>`}</div>`;
+}
+
+function renderVideoMedia(msg) {
+  const m = msg.media; const size = m.fileSize ? formatFileSize(m.fileSize) : ''; const duration = m.duration ? formatDuration(m.duration) : '';
+  const icon = m.isVideoNote ? '⏺️' : '🎬'; const label = m.isVideoNote ? 'Video Message' : (m.fileName || 'Video');
+  return `<div class="media-video-container" data-msg-id="${msg.id}"><div class="media-video-badge"><div class="media-video-icon">${icon}</div><div class="media-video-info"><span class="media-video-name">${escHtml(label)}</span><span class="media-video-meta">${[duration, size].filter(Boolean).join(' • ')}</span></div></div><div class="media-video-actions"><button class="btn-primary btn-sm media-play-btn" onclick="window._playVideo(${msg.id}, '${escAttr(m.mimeType || 'video/mp4')}')">▶ Play</button><button class="btn-outline btn-sm" onclick="window._downloadUserMedia(${msg.id})">📥 Save</button></div><div class="media-video-player hidden" id="videoPlayer_${msg.id}"></div></div>`;
+}
+
+function renderAudioMedia(msg) {
+  const m = msg.media; const size = m.fileSize ? formatFileSize(m.fileSize) : ''; const duration = m.duration ? formatDuration(m.duration) : '';
+  const icon = m.isVoice ? '🎤' : '🎵'; const label = m.isVoice ? 'Voice Message' : (m.fileName || 'Audio');
+  return `<div class="media-video-container" data-msg-id="${msg.id}"><div class="media-video-badge"><div class="media-video-icon">${icon}</div><div class="media-video-info"><span class="media-video-name">${escHtml(label)}</span><span class="media-video-meta">${[duration, size].filter(Boolean).join(' • ')}</span></div></div><div class="media-video-actions"><button class="btn-primary btn-sm media-play-btn" onclick="window._playVideo(${msg.id}, '${escAttr(m.mimeType || 'audio/ogg')}')">▶ Play</button><button class="btn-outline btn-sm" onclick="window._downloadUserMedia(${msg.id})">📥 Save</button></div><div class="media-video-player hidden" id="videoPlayer_${msg.id}"></div></div>`;
+}
+
+function renderFileMedia(msg) {
+  const m = msg.media; const icon = getFileIcon(m.mimeType, m.fileName);
+  const size = m.fileSize ? formatFileSize(m.fileSize) : ''; const name = m.fileName || 'File';
+  return `<div class="media-file-container" onclick="window._downloadUserMedia(${msg.id})"><span class="media-file-icon">${icon}</span><span class="media-file-name">${escHtml(name)} ${size ? `(${size})` : ''}</span><span class="media-file-dl">📥 Download</span></div>`;
 }
 
 function renderReplyBar(msg) {
   if (!msg.replyToMsgId) return '';
   const preview = msg.replyToText || `Message #${msg.replyToMsgId}`;
   const short = preview.length > 60 ? preview.substring(0, 60) + '...' : preview;
-  return `<div class="reply-quote-bar" style="cursor:pointer; margin-bottom:4px;" onclick="document.getElementById('msg_${msg.replyToMsgId}')?.scrollIntoView({behavior:'smooth', block:'center'}); document.getElementById('msg_${msg.replyToMsgId}')?.classList.add('highlight-msg'); setTimeout(()=>document.getElementById('msg_${msg.replyToMsgId}')?.classList.remove('highlight-msg'),1500);">
-    <span class="reply-quote-text">↩ ${escHtml(short)}</span>
-  </div>`;
+  return `<div class="reply-quote-bar" style="cursor:pointer; margin-bottom:4px;" onclick="document.getElementById('msg_${msg.replyToMsgId}')?.scrollIntoView({behavior:'smooth', block:'center'}); document.getElementById('msg_${msg.replyToMsgId}')?.classList.add('highlight-msg'); setTimeout(()=>document.getElementById('msg_${msg.replyToMsgId}')?.classList.remove('highlight-msg'),1500);"><span class="reply-quote-text">↩ ${escHtml(short)}</span></div>`;
 }
 
-function smartDate(date) {
-  if (!date) return '';
-  const now = new Date();
-  const d = date instanceof Date ? date : new Date(date);
-  const isToday = d.toDateString() === now.toDateString();
-  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
-  const isYesterday = d.toDateString() === yesterday.toDateString();
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  if (isToday) return time;
-  if (isYesterday) return `Yesterday ${time}`;
-  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
-}
+// ===== Thumbnails & Media Globals =====
 
-function appendUserMessage(msg) {
-  const list = document.getElementById('messageList');
-  if (!list) return;
-  const ph = list.querySelector(':scope > p.text-dim');
-  if (ph) ph.remove();
-
-  const div = document.createElement('div');
-  div.id = `msg_${msg.id}`;
-  const time = smartDate(msg.date);
-  const isOut = msg.out;
-  const replyBar = renderReplyBar(msg);
-
-  if (isOut) {
-    div.className = 'reply-sent';
-    div.innerHTML = `
-      ${replyBar}
-      ${msg.text ? `<div class="reply-sent-text">${escHtml(msg.text)}</div>` : ''}
-      ${msg.media ? renderMediaBadge(msg) : ''}
-      <div class="reply-sent-time">${time}</div>
-    `;
-  } else {
-    div.className = 'reply-received clickable-msg';
-    div.innerHTML = `
-      ${replyBar}
-      ${msg.media ? renderMediaBadge(msg) : ''}
-      ${msg.text ? `<div class="reply-received-text">${escHtml(msg.text)}</div>` : ''}
-      <div class="reply-received-time">${time} • tap to reply ↩</div>
-    `;
-    div.addEventListener('click', () => {
-      setUserReplyTo(msg.id, msg.text || '[Media]');
-    });
+async function loadVisibleThumbnails() {
+  if (!userClient || !userClient.connected) return;
+  for (const container of document.querySelectorAll('.media-photo-container')) {
+    const msgId = parseInt(container.dataset.msgId);
+    if (thumbCache.has(msgId)) continue;
+    const rawMsg = rawMessageCache.get(msgId);
+    if (!rawMsg) continue;
+    try {
+      const thumbUrl = await userClient.getPhotoThumb(rawMsg);
+      if (thumbUrl) {
+        thumbCache.set(msgId, thumbUrl);
+        const ph = container.querySelector('.media-photo-placeholder');
+        if (ph) ph.outerHTML = `<img src="${thumbUrl}" class="media-photo-thumb" alt="📷" onclick="window._openPhotoLightbox(${msgId})" />`;
+      }
+    } catch {}
   }
-
-  list.appendChild(div);
-  list.scrollTop = list.scrollHeight;
 }
 
-function renderMediaBadge(msg) {
-  if (!msg.media) return '';
-  const m = msg.media;
-  const icon = m.type === 'photo' ? '📷' : getFileIcon(m.mimeType, m.fileName);
-  const size = m.fileSize ? formatFileSize(m.fileSize) : '';
-  const name = m.type === 'photo' ? 'Photo' : (m.fileName || 'File');
-  return `
-    <div style="display:flex; align-items:center; gap:8px; margin: 4px 0; padding: 6px 8px; background: rgba(0,136,204,0.1); border-radius: 6px; cursor: pointer;" 
-         onclick="window._downloadUserMedia && window._downloadUserMedia(${msg.id})">
-      <span>${icon}</span>
-      <span style="font-size: 0.82rem;">${escHtml(name)} ${size ? `(${size})` : ''}</span>
-      <span style="font-size: 0.75rem; color: var(--primary);">📥 Download</span>
-    </div>
-  `;
-}
-
-// Global download handler
-window._downloadUserMedia = async (msgId) => {
-  if (!userClient || !userClient.connected || !currentEntity) return;
+window._loadAndShowPhoto = async (msgId) => {
+  if (!userClient || !userClient.connected) return;
+  const rawMsg = rawMessageCache.get(msgId); if (!rawMsg) return;
+  const container = document.querySelector(`.media-photo-container[data-msg-id="${msgId}"]`); if (!container) return;
+  const ph = container.querySelector('.media-photo-placeholder');
+  if (ph) ph.innerHTML = '<span>⏳</span><span class="media-photo-label">Loading...</span>';
   try {
-    userLog('info', `Downloading message #${msgId}...`);
-    const messages = await userClient.getMessages(currentEntity, 1, msgId + 1);
-    const msg = messages.find(m => m.id === msgId);
-    if (!msg || !msg.message) { userLog('error', 'Message not found.'); return; }
+    const thumbUrl = await userClient.getPhotoThumb(rawMsg);
+    if (thumbUrl) { thumbCache.set(msgId, thumbUrl); if (ph) ph.outerHTML = `<img src="${thumbUrl}" class="media-photo-thumb" alt="📷" onclick="window._openPhotoLightbox(${msgId})" />`; }
+    else if (ph) ph.innerHTML = '<span>📷</span><span class="media-photo-label">Failed</span>';
+  } catch { if (ph) ph.innerHTML = '<span>📷</span><span class="media-photo-label">Failed</span>'; }
+};
 
-    const media = msg.media;
-    const fileName = media?.fileName || (media?.type === 'photo' ? `photo_${msgId}.jpg` : `file_${msgId}`);
-    const mimeType = media?.mimeType || (media?.type === 'photo' ? 'image/jpeg' : 'application/octet-stream');
-
+window._openPhotoLightbox = async (msgId) => {
+  const thumbUrl = thumbCache.get(msgId);
+  const overlay = document.createElement('div'); overlay.className = 'photo-lightbox';
+  overlay.innerHTML = `<img src="${thumbUrl || ''}" alt="Photo" id="lightboxImg_${msgId}" /><div class="lightbox-actions"><button class="lightbox-btn" id="lightboxDl_${msgId}">📥 Save</button><button class="lightbox-btn lightbox-close-btn">✕</button></div><div class="lightbox-loading hidden" id="lightboxLoading_${msgId}">Loading full size...</div>`;
+  overlay.querySelector('.lightbox-close-btn').addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelector(`#lightboxDl_${msgId}`).addEventListener('click', async (e) => {
+    e.stopPropagation(); if (!userClient?.connected) return;
+    const rawMsg = rawMessageCache.get(msgId); if (!rawMsg) return;
     document.getElementById('userProgressBox')?.classList.remove('hidden');
-    await userClient.downloadAndSave(msg.message, fileName, mimeType);
-    setTimeout(() => { document.getElementById('userProgressBox')?.classList.add('hidden'); }, 2000);
-  } catch (e) {
-    userLog('error', `Download failed: ${e.message}`);
-    document.getElementById('userProgressBox')?.classList.add('hidden');
+    try { await userClient.downloadAndSave(rawMsg, `photo_${msgId}.jpg`, 'image/jpeg'); } catch (err) { userLog('error', `Download failed: ${err.message}`); }
+    setTimeout(() => document.getElementById('userProgressBox')?.classList.add('hidden'), 2000);
+  });
+  document.body.appendChild(overlay);
+  if (userClient?.connected) {
+    const rawMsg = rawMessageCache.get(msgId);
+    if (rawMsg) {
+      const ld = overlay.querySelector(`#lightboxLoading_${msgId}`); if (ld) ld.classList.remove('hidden');
+      try { const fullUrl = await userClient.getFullPhoto(rawMsg); if (fullUrl) { const img = overlay.querySelector(`#lightboxImg_${msgId}`); if (img) img.src = fullUrl; } } catch {}
+      if (ld) ld.classList.add('hidden');
+    }
   }
 };
 
-// ===== Reply To =====
+window._playVideo = async (msgId, mimeType) => {
+  if (!userClient?.connected) return;
+  const rawMsg = rawMessageCache.get(msgId); if (!rawMsg) return;
+  const pc = document.getElementById(`videoPlayer_${msgId}`); if (!pc) return;
+  if (pc.querySelector('video, audio')) { pc.classList.toggle('hidden'); return; }
+  pc.classList.remove('hidden');
+  pc.innerHTML = '<div class="text-dim" style="padding:8px; font-size:0.82rem;">⏳ Downloading...</div>';
+  document.getElementById('userProgressBox')?.classList.remove('hidden');
+  try {
+    const isAudio = mimeType.startsWith('audio/');
+    const blobUrl = await userClient.downloadMediaForPlayback(rawMsg, mimeType);
+    if (blobUrl) pc.innerHTML = isAudio ? `<audio controls autoplay style="width:100%; margin-top:4px;" src="${blobUrl}"></audio>` : `<video controls autoplay playsinline style="width:100%; max-height:300px; border-radius:8px; margin-top:4px;" src="${blobUrl}"></video>`;
+    else pc.innerHTML = '<div class="text-dim" style="padding:8px;">Failed.</div>';
+  } catch (e) { pc.innerHTML = '<div class="text-dim" style="padding:8px;">Failed.</div>'; userLog('error', `Play failed: ${e.message}`); }
+  setTimeout(() => document.getElementById('userProgressBox')?.classList.add('hidden'), 1000);
+};
+
+window._downloadUserMedia = async (msgId) => {
+  if (!userClient?.connected || !currentEntity) return;
+  userLog('info', `Downloading #${msgId}...`);
+  let rawMsg = rawMessageCache.get(msgId);
+  if (!rawMsg) { const msgs = await userClient.getMessages(currentEntity, 1, msgId + 1); const m = msgs.find(m => m.id === msgId); if (!m?.message) { userLog('error', 'Not found.'); return; } rawMsg = m.message; }
+  const media = rawMsg.media; let fileName, mimeType;
+  if (media?.document) { fileName = 'file'; mimeType = media.document.mimeType || 'application/octet-stream'; for (const a of media.document.attributes || []) { if (a.className === 'DocumentAttributeFilename') fileName = a.fileName; } }
+  else if (media?.photo) { fileName = `photo_${msgId}.jpg`; mimeType = 'image/jpeg'; }
+  else { fileName = `file_${msgId}`; mimeType = 'application/octet-stream'; }
+  document.getElementById('userProgressBox')?.classList.remove('hidden');
+  try { await userClient.downloadAndSave(rawMsg, fileName, mimeType); } catch (e) { userLog('error', `Download failed: ${e.message}`); }
+  setTimeout(() => document.getElementById('userProgressBox')?.classList.add('hidden'), 2000);
+};
+
+// ===== Reply & Send =====
 
 function setUserReplyTo(msgId, preview) {
   userReplyToMsgId = msgId;
   const input = document.getElementById('userMsgInput');
-  if (input) {
-    input.placeholder = `↩ Reply to: ${(preview || '').substring(0, 50)}...`;
-    input.focus();
-  }
+  if (input) { input.placeholder = `↩ Reply to: ${(preview || '').substring(0, 50)}...`; input.focus(); }
 }
-
-// Global helper to clear reply
-window._clearUserReply = () => { 
-  userReplyToMsgId = null;
-  const input = document.getElementById('userMsgInput');
-  if (input) input.placeholder = 'Type a message...';
-};
-
-// ===== Send Message =====
+window._clearUserReply = () => { userReplyToMsgId = null; const input = document.getElementById('userMsgInput'); if (input) input.placeholder = 'Type a message...'; };
 
 async function handleUserSendMessage() {
-  if (!userClient || !userClient.connected || !currentEntity) return;
-  const input = document.getElementById('userMsgInput');
-  const text = input?.value?.trim();
-  if (!text) return;
-
+  if (!userClient?.connected || !currentEntity) return;
+  const input = document.getElementById('userMsgInput'); const text = input?.value?.trim(); if (!text) return;
   try {
     await userClient.sendMessage(currentEntity, text, userReplyToMsgId || undefined);
-    const sentMsg = {
-      id: Date.now(),
-      text,
-      date: new Date(),
-      out: true,
-      media: null,
-      replyToMsgId: userReplyToMsgId || null,
-    };
-    appendUserMessage(sentMsg);
-    // Force scroll to bottom after sending
+    appendUserMessage({ id: Date.now(), text, date: new Date(), out: true, media: null, replyToMsgId: userReplyToMsgId || null });
     const msgList = document.getElementById('messageList');
     if (msgList) setTimeout(() => { msgList.scrollTop = msgList.scrollHeight; }, 50);
-    input.value = '';
-    input.placeholder = 'Type a message...';
-    userReplyToMsgId = null;
-    input.focus();
-  } catch (e) {
-    userLog('error', `Send failed: ${e.message}`);
-  }
+    input.value = ''; input.placeholder = 'Type a message...'; userReplyToMsgId = null; input.focus();
+  } catch (e) { userLog('error', `Send failed: ${e.message}`); }
 }
 
-// ===== Progress =====
+// ===== User Settings =====
+
+function loadUserSettingsUI() {
+  const s = getUserSettings();
+  const el = (id) => document.getElementById(id);
+  if (el('userSettingsStealth')) el('userSettingsStealth').checked = !!s.stealthMode;
+  if (el('userSettingsAutoPhotos')) el('userSettingsAutoPhotos').checked = s.autoDownloadPhotos !== false;
+  if (el('userSettingsNotify')) el('userSettingsNotify').checked = s.notifyNewMessages !== false;
+  if (el('userSettingsEnterSend')) el('userSettingsEnterSend').checked = s.sendWithEnter !== false;
+  if (el('userSettingsProxy')) el('userSettingsProxy').checked = !!s.proxyEnabled;
+  if (el('userSettingsProxyDomain')) el('userSettingsProxyDomain').value = s.proxyDomain || '';
+  if (el('userSettingsFontSize')) el('userSettingsFontSize').value = s.fontSize || 'normal';
+}
+
+function handleSaveUserSettings() {
+  const s = getUserSettings();
+  s.stealthMode = !!document.getElementById('userSettingsStealth')?.checked;
+  s.autoDownloadPhotos = !!document.getElementById('userSettingsAutoPhotos')?.checked;
+  s.notifyNewMessages = !!document.getElementById('userSettingsNotify')?.checked;
+  s.sendWithEnter = !!document.getElementById('userSettingsEnterSend')?.checked;
+  s.proxyEnabled = !!document.getElementById('userSettingsProxy')?.checked;
+  let pd = (document.getElementById('userSettingsProxyDomain')?.value || '').trim().replace(/^https?:\/\//i, '').replace(/^wss?:\/\//i, '').replace(/\/+$/, '');
+  s.proxyDomain = pd;
+  s.fontSize = document.getElementById('userSettingsFontSize')?.value || 'normal';
+  saveUserSettings(s);
+  const status = document.getElementById('userSettingsSaveStatus');
+  if (status) { status.textContent = '✅ Saved!'; setTimeout(() => { status.textContent = ''; }, 2000); }
+  userLog('info', `⚙️ Settings saved.`);
+}
+
+function handleResetUserSettings() {
+  saveUserSettings(getUserDefaults()); loadUserSettingsUI();
+  const status = document.getElementById('userSettingsSaveStatus');
+  if (status) { status.textContent = '🔄 Reset'; setTimeout(() => { status.textContent = ''; }, 2000); }
+}
+
+// ===== Helpers =====
 
 function updateUserProgress(progress) {
   const bar = document.getElementById('userProgressBar');
@@ -710,8 +1092,31 @@ function updateUserProgress(progress) {
   if (spd) spd.textContent = `${formatFileSize(progress.speed)}/s`;
 }
 
-function escHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+function smartDate(date) {
+  if (!date) return '';
+  const now = new Date(); const d = date instanceof Date ? date : new Date(date);
+  const isToday = d.toDateString() === now.toDateString();
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (isToday) return time;
+  if (d.toDateString() === yesterday.toDateString()) return `Yesterday ${time}`;
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
 }
+
+/**
+ * Lock/unlock auth inputs during processing to prevent edits.
+ */
+function setAuthInputsLocked(locked) {
+  ['userApiId', 'userApiHash', 'userPhone', 'userCode', 'user2FA'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.readOnly = locked; el.style.opacity = locked ? '0.5' : '1'; }
+  });
+  ['btnUserSubmitCode', 'btnUserSubmit2FA'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = locked;
+  });
+}
+
+function formatDuration(seconds) { if (!seconds) return ''; const m = Math.floor(seconds / 60); const s = Math.floor(seconds % 60); return `${m}:${s.toString().padStart(2, '0')}`; }
+function escHtml(str) { const div = document.createElement('div'); div.textContent = str; return div.innerHTML; }
+function escAttr(str) { return (str || '').replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
