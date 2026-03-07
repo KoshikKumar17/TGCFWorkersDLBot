@@ -37,13 +37,17 @@ function getUIState() {
 /**
  * Get last-used API credentials for auto-fill.
  */
+// Default Telegram Web API credentials (from web.telegram.org)
+const DEFAULT_API_ID = '1025907';
+const DEFAULT_API_HASH = '452b0359b988148995f22ff0f4229750';
+
 function getLastCreds() {
   const accounts = getAccounts();
   if (accounts.length > 0) {
     const last = accounts[accounts.length - 1];
-    return { apiId: last.apiId || '', apiHash: last.apiHash || '' };
+    return { apiId: last.apiId || DEFAULT_API_ID, apiHash: last.apiHash || DEFAULT_API_HASH };
   }
-  return { apiId: '', apiHash: '' };
+  return { apiId: DEFAULT_API_ID, apiHash: DEFAULT_API_HASH };
 }
 
 export function renderUserMode(container, addLog, switchMode) {
@@ -175,6 +179,7 @@ export function renderUserMode(container, addLog, switchMode) {
             <label for="userPhone">Phone Number</label>
             <input type="text" id="userPhone" placeholder="+1234567890" autocomplete="off" />
           </div>
+          <p class="hint">API credentials are pre-filled with Telegram Web defaults. You can use your own from <a href="https://my.telegram.org" target="_blank" style="color:var(--primary)">my.telegram.org</a>.</p>
           <p class="hint">Enter your phone number with country code. You'll receive a code in Telegram.</p>
           <button class="btn-primary mt-12" id="btnUserLogin">🔑 Login</button>
         </div>
