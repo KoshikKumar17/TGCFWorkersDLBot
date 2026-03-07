@@ -761,12 +761,14 @@ export class TGDownloader {
       throw new Error('Invalid chat peer.');
     }
 
-    await this.client.sendMessage(entity, {
-      message: text,
-      replyTo: replyToMsgId || undefined,
-    });
+    const sendOpts = { message: text };
+    if (replyToMsgId) {
+      sendOpts.replyTo = typeof replyToMsgId === 'number' ? replyToMsgId : parseInt(replyToMsgId);
+      this.onLog('dim', `Replying to message #${sendOpts.replyTo}`);
+    }
+    await this.client.sendMessage(entity, sendOpts);
 
-    this.onLog('success', `✉️ Reply sent!`);
+    this.onLog('success', `✉️ Reply sent!${replyToMsgId ? ` (reply to #${replyToMsgId})` : ''}`);
   }
 
   // ===== HELPERS =====

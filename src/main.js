@@ -945,12 +945,15 @@ async function addIncomingMessage(msgInfo) {
   // If chat popup is open for this sender, add the message in real-time
   if (openChatSenderId === msgInfo.senderId) {
     appendMessageToChatPopup({
+      id: msgInfo.id,
       text: msgInfo.text || '',
       hasMedia: msgInfo.hasMedia,
       thumbnailUrl: thumbnailUrl || null,
       _rawMessage: msgInfo.message,
       date: msgInfo.date instanceof Date ? msgInfo.date.toISOString() : msgInfo.date,
       fromBot: false,
+      replyToMsgId: msgInfo.replyToMsgId || null,
+      replyToText: msgInfo.replyToText || null,
     });
   }
 }
