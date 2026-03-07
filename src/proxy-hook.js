@@ -51,9 +51,11 @@ class ProxiedWebSocket extends _OriginalWebSocket {
         const host = match[1]; // e.g. venus-1.web.telegram.org
         const path = match[2] || ''; // e.g. /apiws
         // Rewrite to proxy URL on same origin
+        // Drop subprotocols — CF Workers WebSocketPair doesn't support protocol negotiation
+        // GramJS works fine without them since the underlying transport is binary anyway
         const proxyUrl = `wss://${window.location.host}/api/${host}${path}`;
         proxyLog('info', `🌐 Proxy: ${host}${path} → /api/${host}${path}`);
-        super(proxyUrl, protocols);
+        super(proxyUrl);
         return;
       }
     }
