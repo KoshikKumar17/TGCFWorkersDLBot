@@ -5,6 +5,7 @@
  */
 
 import './polyfills.js';
+import './proxy-hook.js';
 import './style.css';
 import { TGDownloader, getApi } from './telegram-client.js';
 import { parseTelegramLink, describeParsedLink, formatFileSize, getFileIcon } from './link-parser.js';
