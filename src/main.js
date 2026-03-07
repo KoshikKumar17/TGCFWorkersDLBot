@@ -8,7 +8,7 @@ import './polyfills.js';
 import './style.css';
 import { TGDownloader } from './telegram-client.js';
 import { parseTelegramLink, describeParsedLink, formatFileSize, getFileIcon } from './link-parser.js';
-import { initDB, addMessageToConversation, addBotReplyToConversation, getAllConversations, getConversation, saveFile, getAllFiles, markFileDownloaded, clearAllData } from './db.js';
+import { initDB, addMessageToConversation, addBotReplyToConversation, getAllConversations, getConversation, saveFile, getAllFiles, markFileDownloaded, clearAllData, deleteConversation, clearConversations, clearFiles } from './db.js';
 
 // ===== State =====
 let downloader = null;
@@ -114,7 +114,7 @@ function renderApp(hasSavedCreds) {
         <h2><span class="icon">💬</span> Incoming Messages</h2>
         <span class="text-dim" id="msgListeningStatus">Not listening</span>
       </div>
-      <p class="hint mb-8">Messages sent to your bot appear here. Click to reply.</p>
+      <p class="hint mb-8">Messages sent to your bot appear here. Click to reply. <button class="btn-outline btn-sm" id="btnClearChats" style="width:auto; display:inline; padding:2px 8px; font-size:0.72rem;">🗑️ Clear All</button></p>
       <div id="messagesList">
         <p class="text-dim">No messages yet.</p>
       </div>
@@ -126,7 +126,7 @@ function renderApp(hasSavedCreds) {
         <h2><span class="icon">📨</span> Incoming Files</h2>
         <span class="text-dim" id="listeningStatus">Not listening</span>
       </div>
-      <p class="hint mb-8">Send files to your bot — they appear here for download.</p>
+      <p class="hint mb-8">Send files to your bot — they appear here for download. <button class="btn-outline btn-sm" id="btnClearFiles" style="width:auto; display:inline; padding:2px 8px; font-size:0.72rem;">🗑️ Clear All</button></p>
       <div id="incomingList">
         <p class="text-dim">No incoming files yet.</p>
       </div>
@@ -189,8 +189,8 @@ function renderApp(hasSavedCreds) {
           <button class="btn-outline btn-sm" id="btnCloseModal">✕</button>
         </div>
         <div class="modal-body">
-          <div id="replyOriginalMsg" class="reply-original"></div>
           <div id="replyConversation" class="reply-conversation"></div>
+          <div id="replyOriginalMsg"></div>
           <div class="reply-input-row">
             <input type="text" id="replyInput" placeholder="Type your reply..." />
             <button class="btn-primary btn-sm" id="btnSendReply">Send</button>
@@ -271,6 +271,16 @@ function bindEvents() {
   });
   const btnSaveReconnect = document.getElementById('btnSaveReconnect');
   if (btnSaveReconnect) btnSaveReconnect.addEventListener('click', handleSaveReconnect);
+  document.getElementById('btnClearChats').addEventListener('click', async () => {
+    await clearConversations();
+    document.getElementById('messagesList').innerHTML = '<p class="text-dim">No messages yet.</p>';
+    addLog('info', 'All chats cleared.');
+  });
+  document.getElementById('btnClearFiles').addEventListener('click', async () => {
+    await clearFiles();
+    document.getElementById('incomingList').innerHTML = '<p class="text-dim">No incoming files yet.</p>';
+    addLog('info', 'All files cleared.');
+  });
   document.getElementById('btnCloseModal').addEventListener('click', closeReplyModal);
   document.getElementById('btnSendReply').addEventListener('click', handleSendReply);
   document.getElementById('replyInput').addEventListener('keydown', (e) => {
@@ -652,8 +662,16 @@ async function openChatModal(convo) {
   const conversation = document.getElementById('replyConversation');
   const input = document.getElementById('replyInput');
 
-  title.textContent = `💬 ${convo.senderName || 'Chat'}`;
-  originalBox.innerHTML = ''; // No single message quote — full conversation
+  title.innerHTML = `💬 ${escapeHtml(convo.senderName || 'Chat')} <button class="btn-outline btn-sm" style="margin-left:auto; width:auto; padding:2px 8px; font-size:0.7rem;" id="btnDeleteChat">🗑️ Delete</button>`;
+  document.getElementById('btnDeleteChat')?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await deleteConversation(convo.senderId);
+    const el = document.getElementById(`convo_${convo.senderId}`);
+    if (el) el.remove();
+    closeReplyModal();
+    addLog('info', `Chat with ${convo.senderName} deleted.`);
+  });
+  originalBox.innerHTML = '';
 
   // Load full conversation from DB
   const freshConvo = await getConversation(convo.senderId);

@@ -203,6 +203,27 @@ export async function markFileDownloaded(id) {
   };
 }
 
+// ===== Delete single conversation =====
+export async function deleteConversation(senderId) {
+  if (!db) return;
+  const tx = db.transaction('conversations', 'readwrite');
+  tx.objectStore('conversations').delete(senderId);
+}
+
+// ===== Clear conversations only =====
+export async function clearConversations() {
+  if (!db) return;
+  const tx = db.transaction('conversations', 'readwrite');
+  tx.objectStore('conversations').clear();
+}
+
+// ===== Clear files only =====
+export async function clearFiles() {
+  if (!db) return;
+  const tx = db.transaction('files', 'readwrite');
+  tx.objectStore('files').clear();
+}
+
 // ===== Clear all =====
 
 export async function clearAllData() {
