@@ -6,7 +6,7 @@
 
 import './polyfills.js';
 import './style.css';
-import { TGDownloader } from './telegram-client.js';
+import { TGDownloader, getApi } from './telegram-client.js';
 import { parseTelegramLink, describeParsedLink, formatFileSize, getFileIcon } from './link-parser.js';
 import { initDB, addMessageToConversation, addBotReplyToConversation, getAllConversations, getConversation, saveFile, getAllFiles, markFileDownloaded, clearAllData, deleteConversation, clearConversations, clearFiles } from './db.js';
 
@@ -231,13 +231,57 @@ async function restoreFromDB() {
   }
 }
 
+/**
+ * Reconstruct a fileRef object from IndexedDB stored file data.
+ * Uses stored docId/photoId + accessHash + base64 fileReference to rebuild
+ * the Api.InputDocumentFileLocation or Api.InputPhotoFileLocation needed for download.
+ */
+function reconstructFileRef(file) {
+  const Api = getApi();
+  let fileLocation = null;
+
+  if (file.docId && file.docAccessHash && file.docFileReference) {
+    // Document (video, audio, any file)
+    fileLocation = new Api.InputDocumentFileLocation({
+      id: BigInt(file.docId),
+      accessHash: BigInt(file.docAccessHash),
+      fileReference: Buffer.from(file.docFileReference, 'base64'),
+      thumbSize: '',
+    });
+  } else if (file.photoId && file.photoAccessHash && file.photoFileReference) {
+    // Photo
+    fileLocation = new Api.InputPhotoFileLocation({
+      id: BigInt(file.photoId),
+      accessHash: BigInt(file.photoAccessHash),
+      fileReference: Buffer.from(file.photoFileReference, 'base64'),
+      thumbSize: file.thumbSize || '',
+    });
+  }
+
+  if (!fileLocation) return null;
+
+  return {
+    fileName: file.fileName,
+    fileSize: file.fileSize,
+    mimeType: file.mimeType,
+    fileLocation,
+    dcId: file.dcId,
+    message: null, // No live message — uses parallel download path
+    hasMedia: true,
+    chatName: file.chatName || '',
+    dbId: file.id, // IndexedDB key for marking as downloaded
+  };
+}
+
 function renderRestoredFile(file) {
   const list = document.getElementById('incomingList');
   if (!list) return;
-  if (list.querySelector('.text-dim')) list.innerHTML = '';
+  const placeholder = list.querySelector(':scope > p.text-dim');
+  if (placeholder) placeholder.remove();
 
   const icon = getFileIcon(file.mimeType, file.fileName);
   const time = file.date ? new Date(file.date).toLocaleTimeString() : '';
+  const hasIds = !!(file.docId || file.photoId);
 
   const item = document.createElement('div');
   item.className = 'incoming-file-item';
@@ -249,9 +293,71 @@ function renderRestoredFile(file) {
         <div class="file-meta">${formatFileSize(file.fileSize)} • ${file.mimeType || 'Unknown'} • ${file.chatName || ''} • ${time}</div>
       </div>
     </div>
-    <div class="text-dim" style="margin-top:6px; font-size:0.78rem;">${file.downloaded ? '✅ Downloaded' : '⏳ Connect to download'}</div>
+    ${file.downloaded
+      ? '<div class="text-dim" style="margin-top:6px; font-size:0.78rem;">✅ Downloaded</div>'
+      : hasIds
+        ? '<button class="btn-success btn-sm incoming-dl-btn">📥 Download</button>'
+        : '<div class="text-dim" style="margin-top:6px; font-size:0.78rem;">⏳ No file ref stored</div>'
+    }
   `;
+
+  // Wire up download button for files with stored IDs
+  if (!file.downloaded && hasIds) {
+    const btn = item.querySelector('button');
+    if (btn) {
+      btn.addEventListener('click', () => handleRestoredDownload(item, file));
+    }
+  }
+
   list.prepend(item);
+}
+
+/**
+ * Handle download of a restored file from IndexedDB.
+ * Reconstructs the file location from stored IDs and downloads via parallel path.
+ */
+async function handleRestoredDownload(itemEl, file) {
+  if (!isConnected || !downloader || isDownloading) {
+    addLog('warn', 'Cannot download: busy or disconnected.');
+    return;
+  }
+
+  const fileRef = reconstructFileRef(file);
+  if (!fileRef) {
+    addLog('error', 'Could not reconstruct file location from stored data.');
+    return;
+  }
+
+  const btn = itemEl.querySelector('button');
+  const connections = parseInt(document.getElementById('connections')?.value) || 4;
+  btn.disabled = true;
+  btn.innerHTML = '⏳ ...';
+  isDownloading = true;
+  const progressBox = document.getElementById('progressBox');
+  progressBox.classList.remove('hidden');
+  resetProgress();
+
+  try {
+    const { blob, fileInfo } = await downloader.downloadFile(fileRef, connections);
+    downloader.saveBlobAs(blob, fileInfo.fileName);
+
+    // Mark as downloaded in IndexedDB
+    if (fileRef.dbId) {
+      markFileDownloaded(fileRef.dbId).catch(() => {});
+    }
+
+    btn.innerHTML = '✅ Done';
+    btn.className = 'btn-outline btn-sm incoming-dl-btn';
+    setTimeout(() => { progressBox.classList.add('hidden'); resetProgress(); }, 2000);
+  } catch (error) {
+    addLog('error', `Download failed: ${error.message}`);
+    btn.innerHTML = '📥 Retry';
+    btn.disabled = false;
+    progressBox.classList.add('hidden');
+    resetProgress();
+  } finally {
+    isDownloading = false;
+  }
 }
 
 // ===== Event Bindings =====
@@ -504,7 +610,8 @@ let incomingCounter = 0;
 function addIncomingFile(fileRef) {
   const list = document.getElementById('incomingList');
   if (!list) return;
-  if (list.querySelector('.text-dim')) list.innerHTML = '';
+  const placeholder = list.querySelector(':scope > p.text-dim');
+  if (placeholder) placeholder.remove();
 
   const id = `incoming_${incomingCounter++}`;
   const icon = getFileIcon(fileRef.mimeType, fileRef.fileName);
@@ -588,7 +695,9 @@ let openChatSenderId = null; // Currently open chat in modal
 function renderConversationItem(convo, useAppend = false) {
   const list = document.getElementById('messagesList');
   if (!list) return;
-  if (list.querySelector('.text-dim')) list.innerHTML = '';
+  // Only clear the "No messages yet" placeholder — use :scope > p to avoid matching .text-dim inside items
+  const placeholder = list.querySelector(':scope > p.text-dim');
+  if (placeholder) placeholder.remove();
 
   const senderId = convo.senderId;
   const typeIcons = { User: '👤', Channel: '📢', Group: '👥' };

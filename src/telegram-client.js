@@ -11,6 +11,14 @@ import { utils } from 'telegram';
 import { NewMessage } from 'telegram/events';
 import bigInt from 'big-integer';
 
+/**
+ * Expose the Api namespace so main.js can reconstruct file locations
+ * from stored IDs without importing 'telegram' directly.
+ */
+export function getApi() {
+  return Api;
+}
+
 const CREDENTIALS_KEY = 'tg_credentials';
 const MAX_CHUNK_SIZE = 512 * 1024; // 512KB - MTProto max per request
 const MIN_PARALLEL_SIZE = 1024 * 1024; // 1MB - minimum for parallel mode
@@ -285,9 +293,17 @@ export class TGDownloader {
     const { fileSize, fileName, mimeType, fileLocation, dcId } = fileRef;
 
     // For small files or single connection, use simple download
-    if (connections <= 1 || fileSize < MIN_PARALLEL_SIZE) {
+    // Note: _downloadSingle requires a live message object (uses downloadMedia).
+    // Restored files from IndexedDB only have fileLocation, so they must use parallel path.
+    if ((connections <= 1 || fileSize < MIN_PARALLEL_SIZE) && fileRef.message) {
       this.onLog('info', `Downloading ${fileName} [1 connection]...`);
       return this._downloadSingle(fileRef);
+    }
+
+    // If no message object (restored file), force at least 1-connection parallel (uses fileLocation directly)
+    if (!fileRef.message) {
+      connections = Math.max(connections, 1);
+      this.onLog('info', `Downloading ${fileName} [${connections} conn, reconstructed ref]...`);
     }
 
     // Parallel download
@@ -341,8 +357,11 @@ export class TGDownloader {
     } catch (e) {
       this.onLog('warn', `Could only create ${senders.length} senders: ${e.message}`);
       if (senders.length === 0) {
-        this.onLog('warn', 'Falling back to single-connection download...');
-        return this._downloadSingle(fileRef);
+        if (fileRef.message) {
+          this.onLog('warn', 'Falling back to single-connection download...');
+          return this._downloadSingle(fileRef);
+        }
+        throw new Error('Could not create any DC senders for download.');
       }
     }
 
@@ -378,8 +397,11 @@ export class TGDownloader {
     try {
       results = await Promise.all(tasks);
     } catch (e) {
-      this.onLog('warn', `Parallel download failed: ${e.message}. Retrying single...`);
-      return this._downloadSingle(fileRef);
+      if (fileRef.message) {
+        this.onLog('warn', `Parallel download failed: ${e.message}. Retrying single...`);
+        return this._downloadSingle(fileRef);
+      }
+      throw new Error(`Download failed: ${e.message}`);
     }
 
     // Merge all chunks in order into one buffer
