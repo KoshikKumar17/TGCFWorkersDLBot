@@ -621,8 +621,11 @@ async function handleUserLogin() {
     await userClient.authenticate(phonePromise, codePromise, passwordPromise);
     clearAuthProgress();
     onUserLoggedIn();
-    // Switch to main page after login
-    showPage('main');
+    // Re-render the full UI to update status bar and remove "no account" card
+    if (window._userModeSwitchMode) {
+      const app = document.getElementById('app');
+      renderUserMode(app, window._userModeAddLog || userLog, window._userModeSwitchMode);
+    }
   } catch (error) {
     setUserStatus('disconnected');
     userLog('error', `Login failed: ${error.message}`);
