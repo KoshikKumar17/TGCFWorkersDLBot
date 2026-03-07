@@ -15,6 +15,7 @@ let downloader = null;
 let isConnected = false;
 let isDownloading = false;
 let currentFileRef = null;
+let manuallyDisconnected = false; // Prevents auto-reconnect after manual disconnect
 
 // ===== Initialize UI =====
 async function init() {
@@ -71,6 +72,7 @@ function renderApp(hasSavedCreds) {
         <div class="flex-between">
           <span class="text-dim">🔑 Credentials saved</span>
           <div style="display: flex; gap: 8px;">
+            <button class="btn-primary btn-sm" id="btnReconnect" style="display:none;">⚡ Connect</button>
             <button class="btn-danger btn-sm" id="btnDisconnect" style="display:none;">🔌 Disconnect</button>
             <button class="btn-outline btn-sm" id="btnShowCreds">Edit</button>
             <button class="btn-outline btn-sm" id="btnClearSession" title="Clear saved session">🗑️ Clear</button>
@@ -372,6 +374,8 @@ function bindEvents() {
   document.getElementById('btnClearSession').addEventListener('click', handleClearSession);
   const btnDisconnect = document.getElementById('btnDisconnect');
   if (btnDisconnect) btnDisconnect.addEventListener('click', handleDisconnect);
+  const btnReconnect = document.getElementById('btnReconnect');
+  if (btnReconnect) btnReconnect.addEventListener('click', handleReconnect);
   const btnShowCreds = document.getElementById('btnShowCreds');
   if (btnShowCreds) btnShowCreds.addEventListener('click', () => {
     document.getElementById('credsForm').classList.toggle('hidden');
@@ -464,12 +468,42 @@ async function handleSaveReconnect() {
 
 // ===== Disconnect Handler (saved-creds mode) =====
 async function handleDisconnect() {
+  manuallyDisconnected = true;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (downloader) {
     await downloader.disconnect();
   }
   isConnected = false;
   setConnectionStatus('disconnected');
-  addLog('info', 'Disconnected manually.');
+  addLog('info', 'Disconnected manually. Use ⚡ Connect to reconnect.');
+}
+
+// ===== Reconnect Handler (saved-creds mode, after manual disconnect) =====
+async function handleReconnect() {
+  const saved = new TGDownloader(() => {}, () => {}).getSavedCredentials();
+  if (!saved) { addLog('error', 'No saved credentials.'); return; }
+
+  manuallyDisconnected = false;
+  const btn = document.getElementById('btnReconnect');
+  if (btn) { btn.disabled = true; btn.innerHTML = '⏳ ...'; }
+
+  setConnectionStatus('connecting');
+  addLog('info', 'Reconnecting with saved credentials...');
+
+  try {
+    downloader = new TGDownloader(addLog, updateProgress);
+    await downloader.connect(saved.apiId, saved.apiHash, saved.botToken);
+    isConnected = true;
+    listenersStarted = false;
+    setConnectionStatus('connected');
+    startListeners();
+    addLog('success', '✅ Reconnected!');
+  } catch (error) {
+    setConnectionStatus('disconnected');
+    addLog('error', `Reconnect failed: ${error.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '⚡ Connect'; }
+  }
 }
 
 // ===== Auto Reconnect =====
@@ -971,10 +1005,14 @@ function setConnectionStatus(status) {
   badge.className = `status-badge ${status}`;
   text.textContent = status.charAt(0).toUpperCase() + status.slice(1);
   
-  // Show/hide disconnect button in saved-creds mode
+  // Show/hide disconnect & reconnect buttons in saved-creds mode
   const btnDisconnect = document.getElementById('btnDisconnect');
+  const btnReconnect = document.getElementById('btnReconnect');
   if (btnDisconnect) {
     btnDisconnect.style.display = status === 'connected' ? '' : 'none';
+  }
+  if (btnReconnect) {
+    btnReconnect.style.display = (status === 'disconnected') ? '' : 'none';
   }
   
   // Update listening status indicators
@@ -1062,6 +1100,7 @@ let reconnectTimer = null;
 
 function startConnectionWatcher() {
   window.addEventListener('online', () => {
+    if (manuallyDisconnected) return; // Don't auto-reconnect if user chose to disconnect
     addLog('info', '🌐 Internet restored. Reconnecting in 5s...');
     scheduleReconnect(5000);
   });
@@ -1073,6 +1112,7 @@ function startConnectionWatcher() {
     if (btn) { btn.innerHTML = '⚡ Connect'; btn.className = 'btn-primary'; }
   });
   setInterval(async () => {
+    if (manuallyDisconnected) return; // Don't auto-reconnect if user chose to disconnect
     if (!downloader || !navigator.onLine) return;
     if (isConnected && downloader.connected) return;
     if (navigator.onLine && downloader._credentials) {
@@ -1093,7 +1133,7 @@ function startConnectionWatcher() {
 function scheduleReconnect(delayMs) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(async () => {
-    if (!downloader || isConnected) return;
+    if (manuallyDisconnected || !downloader || isConnected) return;
     try {
       setConnectionStatus('connecting');
       await downloader.reconnect();
