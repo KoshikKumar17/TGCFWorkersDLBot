@@ -997,13 +997,13 @@ function renderPhotoMedia(msg) {
 function renderVideoMedia(msg) {
   const m = msg.media; const size = m.fileSize ? formatFileSize(m.fileSize) : ''; const duration = m.duration ? formatDuration(m.duration) : '';
   const icon = m.isVideoNote ? '⏺️' : '🎬'; const label = m.isVideoNote ? 'Video Message' : (m.fileName || 'Video');
-  return `<div class="media-video-container" data-msg-id="${msg.id}"><div class="media-video-badge"><div class="media-video-icon">${icon}</div><div class="media-video-info"><span class="media-video-name">${escHtml(label)}</span><span class="media-video-meta">${[duration, size].filter(Boolean).join(' • ')}</span></div></div><div class="media-video-actions"><button class="btn-primary btn-sm media-play-btn" onclick="window._playVideo(${msg.id}, '${escAttr(m.mimeType || 'video/mp4')}')">▶ Play</button><button class="btn-outline btn-sm" onclick="window._downloadUserMedia(${msg.id})">📥 Save</button></div><div class="media-video-player hidden" id="videoPlayer_${msg.id}"></div></div>`;
+  return `<div class="media-video-container" data-msg-id="${msg.id}"><div class="media-video-badge"><div class="media-video-icon">${icon}</div><div class="media-video-info"><span class="media-video-name">${escHtml(label)}</span><span class="media-video-meta">${[duration, size].filter(Boolean).join(' • ')}</span></div></div><div class="media-video-actions"><button class="btn-primary btn-sm" onclick="window._downloadUserMedia(${msg.id})">📥 Download</button></div></div>`;
 }
 
 function renderAudioMedia(msg) {
   const m = msg.media; const size = m.fileSize ? formatFileSize(m.fileSize) : ''; const duration = m.duration ? formatDuration(m.duration) : '';
   const icon = m.isVoice ? '🎤' : '🎵'; const label = m.isVoice ? 'Voice Message' : (m.fileName || 'Audio');
-  return `<div class="media-video-container" data-msg-id="${msg.id}"><div class="media-video-badge"><div class="media-video-icon">${icon}</div><div class="media-video-info"><span class="media-video-name">${escHtml(label)}</span><span class="media-video-meta">${[duration, size].filter(Boolean).join(' • ')}</span></div></div><div class="media-video-actions"><button class="btn-primary btn-sm media-play-btn" onclick="window._playVideo(${msg.id}, '${escAttr(m.mimeType || 'audio/ogg')}')">▶ Play</button><button class="btn-outline btn-sm" onclick="window._downloadUserMedia(${msg.id})">📥 Save</button></div><div class="media-video-player hidden" id="videoPlayer_${msg.id}"></div></div>`;
+  return `<div class="media-video-container" data-msg-id="${msg.id}"><div class="media-video-badge"><div class="media-video-icon">${icon}</div><div class="media-video-info"><span class="media-video-name">${escHtml(label)}</span><span class="media-video-meta">${[duration, size].filter(Boolean).join(' • ')}</span></div></div><div class="media-video-actions"><button class="btn-primary btn-sm" onclick="window._downloadUserMedia(${msg.id})">📥 Download</button></div></div>`;
 }
 
 function renderFileMedia(msg) {
