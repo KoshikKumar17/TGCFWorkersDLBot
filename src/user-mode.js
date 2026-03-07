@@ -80,6 +80,12 @@ export function renderUserMode(container, addLog, switchMode) {
       <div class="form-group" style="margin-bottom: 8px;">
         <input type="text" id="chatSearch" placeholder="🔍 Search chats..." style="padding: 8px 12px; font-size: 0.88rem;" />
       </div>
+      <div style="display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap;">
+        <button class="btn-outline btn-sm chat-filter-btn active" data-filter="all" style="font-size:0.75rem; padding:4px 10px;">All</button>
+        <button class="btn-outline btn-sm chat-filter-btn" data-filter="user" style="font-size:0.75rem; padding:4px 10px;">👤 Private</button>
+        <button class="btn-outline btn-sm chat-filter-btn" data-filter="group" style="font-size:0.75rem; padding:4px 10px;">👥 Groups</button>
+        <button class="btn-outline btn-sm chat-filter-btn" data-filter="channel" style="font-size:0.75rem; padding:4px 10px;">📢 Channels</button>
+      </div>
       <div id="chatList" style="max-height: 400px; overflow-y: auto;">
         <p class="text-dim">Loading chats...</p>
       </div>
@@ -179,6 +185,15 @@ function bindUserEvents(addLog, switchMode) {
   document.getElementById('chatSearch')?.addEventListener('input', (e) => {
     filterDialogs(e.target.value.toLowerCase());
   });
+  // Chat type filter tabs
+  document.querySelectorAll('.chat-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.chat-filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const filter = btn.dataset.filter;
+      filterDialogsByType(filter);
+    });
+  });
 }
 
 // ===== Auth Flow =====
@@ -264,11 +279,23 @@ function onUserLoggedIn() {
   // Show chats
   document.getElementById('userChatsCard')?.classList.remove('hidden');
   loadDialogs();
-  // Listen for new messages
+  // Listen for new messages — only append if it belongs to the currently open chat
   userClient.startListening((msg) => {
-    // If viewing this chat, append message
-    if (currentEntity && msg.senderId) {
+    if (!currentEntity || !currentDialogId) return;
+    // Check if this message belongs to the currently viewed chat
+    const msgChatId = msg.message?.peerId?.channelId?.toString() || 
+                      msg.message?.peerId?.chatId?.toString() ||
+                      msg.message?.peerId?.userId?.toString() || '';
+    // Match against current dialog ID (may have -100 prefix for channels)
+    if (currentDialogId === msgChatId || 
+        currentDialogId === `-100${msgChatId}` || 
+        currentDialogId === `-${msgChatId}` ||
+        msg.senderId === currentDialogId) {
       appendUserMessage(msg);
+      // Also mark as read
+      if (msg.id) {
+        userClient.markAsRead(currentEntity, msg.id).catch(() => {});
+      }
     }
   });
 }
@@ -338,6 +365,20 @@ function filterDialogs(query) {
     return;
   }
   const filtered = dialogsCache.filter(d => d.title.toLowerCase().includes(query));
+  renderDialogs(filtered);
+}
+
+function filterDialogsByType(type) {
+  if (type === 'all') {
+    renderDialogs(dialogsCache);
+    return;
+  }
+  const filtered = dialogsCache.filter(d => {
+    if (type === 'user') return d.isUser;
+    if (type === 'group') return d.isGroup;
+    if (type === 'channel') return d.isChannel;
+    return true;
+  });
   renderDialogs(filtered);
 }
 

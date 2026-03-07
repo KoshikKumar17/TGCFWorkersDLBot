@@ -729,6 +729,13 @@ button:disabled {
   border-radius: 50%;
 }
 
+/* ===== Filter Buttons ===== */
+.chat-filter-btn.active {
+  background: var(--primary) !important;
+  color: white !important;
+  border-color: var(--primary) !important;
+}
+
 /* ===== Responsive ===== */
 @media (max-width: 600px) {
   .form-row {
