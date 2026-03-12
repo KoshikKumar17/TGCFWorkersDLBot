@@ -12,7 +12,7 @@ import { NewMessage } from 'teleproto/events';
 import { ConnectionTCPObfuscated } from 'teleproto/network/connection/TCPObfuscated';
 import bigInt from 'big-integer';
 import { BrowserSession } from './shims/browser-session.js';
-import { PromisedWebSockets } from './shims/promised-web-sockets.js';
+import { PromisedWebSockets, getDCWebSocketHost } from './shims/promised-web-sockets.js';
 
 /**
  * Expose the Api namespace so main.js can reconstruct file locations
@@ -50,6 +50,15 @@ export class TGDownloader {
         connection: ConnectionTCPObfuscated,
         networkSocket: PromisedWebSockets,
       });
+      // Override getDC to always return WebSocket hostnames (not IPs).
+      // This is critical for browser WebSocket + proxy compatibility.
+      const originalGetDC = this.client.getDC.bind(this.client);
+      this.client.getDC = async (dcId, downloadDC = false) => {
+        const dc = await originalGetDC(dcId, downloadDC);
+        dc.ipAddress = getDCWebSocketHost(dcId);
+        dc.port = 443;
+        return dc;
+      };
       this.onLog('info', 'Connecting to Telegram servers...');
       await this.client.start({ botAuthToken: botToken });
       localStorage.setItem(CREDENTIALS_KEY, JSON.stringify({ apiId, apiHash, botToken }));

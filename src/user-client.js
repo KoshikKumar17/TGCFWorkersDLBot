@@ -12,7 +12,7 @@ import { NewMessage } from 'teleproto/events';
 import { ConnectionTCPObfuscated } from 'teleproto/network/connection/TCPObfuscated';
 import bigInt from 'big-integer';
 import { BrowserSession } from './shims/browser-session.js';
-import { PromisedWebSockets } from './shims/promised-web-sockets.js';
+import { PromisedWebSockets, getDCWebSocketHost } from './shims/promised-web-sockets.js';
 import { getUserSettings } from './settings.js';
 
 const MIN_PARALLEL_SIZE = 1024 * 1024; // 1MB — below this, single-connection is fine
@@ -145,6 +145,7 @@ export class TGUserClient {
       connection: ConnectionTCPObfuscated,
       networkSocket: PromisedWebSockets,
     });
+    this._patchGetDC();
     await this.client.connect();
     this.onLog('dim', 'Client connected, awaiting authentication...');
   }
@@ -209,6 +210,7 @@ export class TGUserClient {
       connection: ConnectionTCPObfuscated,
       networkSocket: PromisedWebSockets,
     });
+    this._patchGetDC();
 
     await this.client.connect();
 
@@ -807,6 +809,21 @@ export class TGUserClient {
   }
 
   // ===== HELPERS =====
+
+  /**
+   * Override getDC to always return WebSocket hostnames instead of IPs.
+   * Critical for browser WebSocket + proxy compatibility.
+   */
+  _patchGetDC() {
+    if (!this.client) return;
+    const originalGetDC = this.client.getDC.bind(this.client);
+    this.client.getDC = async (dcId, downloadDC = false) => {
+      const dc = await originalGetDC(dcId, downloadDC);
+      dc.ipAddress = getDCWebSocketHost(dcId);
+      dc.port = 443;
+      return dc;
+    };
+  }
 
   _formatSize(bytes) {
     if (!bytes) return '0 B';
